@@ -1,0 +1,99 @@
+﻿{
+    "collected_utc":  "2026-08-30T09:03:05.2961775Z",
+    "collector":  "collect_environment.ps1 v1",
+    "windows":  {
+                    "caption":  "Microsoft Windows 11 专业版",
+                    "version":  "10.0.26200",
+                    "build":  "26200.9168"
+                },
+    "cpu":  {
+                "name":  "AMD Ryzen 5 7500F 6-Core Processor",
+                "cores":  6,
+                "logical":  12,
+                "max_clock_mhz":  3701
+            },
+    "gpus":  [
+                 {
+                     "name":  "AMD Radeon RX 9070 XT",
+                     "vendor_id":  "0x1002",
+                     "device_id":  "0x7550",
+                     "pnp_device_id":  "PCI\\VEN_1002\u0026DEV_7550\u0026SUBSYS_34901DA2\u0026REV_C0\\6\u00268916A45\u00260\u002600000009",
+                     "driver_version":  "32.0.31041.1004",
+                     "driver_date":  "\/Date(1786924800000)\/",
+                     "adapter_ram":  4293918720,
+                     "video_processor":  "AMD Radeon Graphics Processor (0x7550)",
+                     "is_amd":  true,
+                     "is_nvidia":  false
+                 },
+                 {
+                     "name":  "GameViewer Virtual Display Adapter",
+                     "vendor_id":  null,
+                     "device_id":  null,
+                     "pnp_device_id":  "ROOT\\DISPLAY\\0000",
+                     "driver_version":  "15.6.5.199",
+                     "driver_date":  "\/Date(1772236800000)\/",
+                     "adapter_ram":  null,
+                     "video_processor":  null,
+                     "is_amd":  false,
+                     "is_nvidia":  false
+                 }
+             ],
+    "amd_adapter_present":  true,
+    "nvidia_adapter_present":  false,
+    "dxgi_d3d12":  {
+                       "status":  "env_probe.exe not built yet (see README build steps)"
+                   },
+    "hip":  {
+                "installed":  true,
+                "path":  "C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core",
+                "rocm_version":  "7.2.0",
+                "hipinfo_excerpt":  "--------------------------------------------------------------------------------\r\ndevice#                           0\r\nName:                             AMD Radeon RX 9070 XT\r\npciBusID:                         3\r\npciDeviceID:                      0\r\npciDomainID:                      0\r\nmultiProcessorCount:              32\r\nmaxThreadsPerMultiProcessor:      2048\r\nisMultiGpuBoard:                  0\r\nclockRate:                        2460 Mhz\r\nmemoryClockRate:                  1259 Mhz\r\nmemoryBusWidth:                   256\r\ntotalGlobalMem:                   15.92 GB\r\ntotalConstMem:                    2147483647\r\nsharedMemPerBlock:                64.00 KB\r\ncanMapHostMemory:                 1\r\nregsPerBlock:                     196608\r\nwarpSize:                         32\r\nl2CacheSize:                      8388608\r\ncomputeMode:                      0\r\nmaxThreadsPerBlock:               1024\r\nmaxThreadsDim.x:                  1024\r\nmaxThreadsDim.y:                  1024\r\nmaxThreadsDim.z:                  1024\r\nmaxGridSize.x:                    2147483647\r\nmaxGridSize.y:                    65536\r\nmaxGridSize.z:                    65536\r\nmajor:                            12\r\nminor:                            0\r\nconcurrentKernels:                1\r\ncooperativeLaunch:                0\r\ncooperativeMultiDeviceLaunch:     0\r\nisIntegrated:                     0\r\nmaxTexture1D:                     16384\r\nmaxTexture2D.width:               16384\r\nmaxTexture2D.height:              16384\r\nmaxTexture3D.width:               2048\r\nmaxTexture3D.height:              2048\r\nmaxTexture3D.depth:               2048"
+            },
+    "zluda":  {
+                  "detected":  false,
+                  "note":  "ZLUDA_PATH not set; get release from github.com/vosen/ZLUDA (user installs)"
+              },
+    "toolchain":  {
+                      "cmake":  {
+                                    "found":  false
+                                },
+                      "rustc":  {
+                                    "found":  true,
+                                    "path":  "C:\\Users\\20426\\.cargo\\bin\\rustc.exe",
+                                    "version":  "rustc 1.94.1 (e408947bf 2026-03-25)"
+                                },
+                      "clang":  {
+                                    "found":  false
+                                },
+                      "nvcc":  {
+                                   "found":  false
+                               },
+                      "git":  {
+                                  "found":  true,
+                                  "path":  "C:\\Program Files\\Git\\cmd\\git.exe",
+                                  "version":  "git version 2.45.1.windows.1"
+                              },
+                      "visual_studio":  {
+                                            "found":  true,
+                                            "path":  "C:\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools",
+                                            "version":  "18.4.11620.152"
+                                        },
+                      "msvc_tools_version":  "14.50.35717",
+                      "windows_sdk_root":  "C:\\Program Files (x86)\\Windows Kits\\10\\",
+                      "windows_sdk_versions":  null
+                  },
+    "proprietary_prerequisites":  {
+                                      "DLSSNR_DLL_PATH":  {
+                                                              "present":  false,
+                                                              "env_var":  "DLSSNR_DLL_PATH"
+                                                          },
+                                      "DLSS_DLL_PATH":  {
+                                                            "present":  false,
+                                                            "env_var":  "DLSS_DLL_PATH"
+                                                        },
+                                      "RENODX_DLSS5_ADDON_PATH":  {
+                                                                      "present":  false,
+                                                                      "env_var":  "RENODX_DLSS5_ADDON_PATH"
+                                                                  }
+                                  }
+}

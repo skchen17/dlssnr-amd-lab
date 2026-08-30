@@ -1,0 +1,25 @@
+file  : ..\file\nvngx_dlssnr.dll
+size  : 165840496 bytes
+sha256: e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e
+PE    : machine=0x8664 (AMD64) timestamp=1786480171 sections=7
+  sec .text    va=0x00001000 vsize=0x000aadfc raw=0x00000400 rawsz=0x000aae00 flags=0x60000020
+  sec .rdata   va=0x000ac000 vsize=0x0003361e raw=0x000ab200 rawsz=0x00033800 flags=0x40000040
+  sec .data    va=0x000e0000 vsize=0x0107aa84 raw=0x000dea00 rawsz=0x01062800 flags=0xc0000040
+  sec .pdata   va=0x0115b000 vsize=0x00008640 raw=0x01141200 rawsz=0x00008800 flags=0x40000040
+  sec _RDATA   va=0x01164000 vsize=0x000000f4 raw=0x01149a00 rawsz=0x00000200 flags=0x40000040
+  sec .rsrc    va=0x01165000 vsize=0x08cdac98 raw=0x01149c00 rawsz=0x08cdae00 flags=0x40000040
+  sec .reloc   va=0x09e40000 vsize=0x0000126c raw=0x09e24a00 rawsz=0x00001400 flags=0x42000040
+  import VERSION.dll: 3 funcs
+  import ADVAPI32.dll: 3 funcs
+  import USER32.dll: 1 funcs
+  import KERNEL32.dll: 120 funcs
+  .rsrc present: size=147696792
+elf payloads: 15 found (15 with EM_CUDA=190)
+high-entropy run @0xe0000 size=1114112 bytes maxEnt=7.995
+high-entropy run @0x4b0000 size=720896 bytes maxEnt=7.995
+high-entropy run @0x700000 size=786432 bytes maxEnt=7.995
+high-entropy run @0x950000 size=917504 bytes maxEnt=7.995
+high-entropy run @0xbd0000 size=524288 bytes maxEnt=7.993
+high-entropy run @0xde0000 size=655360 bytes maxEnt=7.995
+manifest written: C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\results\20260830_170305\binary_manifest_dlssnr.json
+

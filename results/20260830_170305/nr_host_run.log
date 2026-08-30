@@ -1,0 +1,9 @@
+=== nr_host (dlssnr-amd-lab Phase 5 skeleton) ===
+trace mode: set these env vars and rerun under the shims:
+  MODULE_TRACE_LOG=<path>  (inject build\module_trace.dll)
+  NVAPI_TRACE_LOG=<path>   (place build\nvapi64.dll as the game's nvapi64.dll)
+inputs: color=1048576B depth=1048576B motion=1048576B exposure=0.180 (deterministic LCG 0x2545F491)
+reference package written to results\20260830_180553_reference_package\ (copy to an NVIDIA machine)
+
+{"status": "BLOCKED_MISSING_PREREQUISITE", "frames": 1, "width": 512, "height": 512, "detail": "nvngx_dlss.dll missing (set DLSS_DLL_PATH)"}
+

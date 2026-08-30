@@ -1,0 +1,12 @@
+{
+  "tests": [
+    {"name": "A_device_enum", "ran": true, "pass": true, "kernel_ms": -1.0000, "detail": "count=1 name=AMD Radeon RX 9070 XT gcnArch=gfx1201 vram=17.10GB"},
+    {"name": "B_alloc_roundtrip", "ran": true, "pass": true, "kernel_ms": -1.0000, "detail": "memset+memcpy roundtrip exact"},
+    {"name": "C_fp32_vadd", "ran": true, "pass": true, "kernel_ms": 0.0642, "detail": "N=1048576 maxErr=5.960e-08 kernel=0.0642ms"},
+    {"name": "D_fp16_gemm", "ran": true, "pass": true, "kernel_ms": 1.6498, "detail": "N=64 maxErr=3.255e-03 rmse=5.373e-04 kernel=1.6498ms"},
+    {"name": "E_fp8_e4m3", "ran": true, "pass": true, "kernel_ms": -1.0000, "detail": "e4m3 N=4096 quantMismatch=0 maxBackDiff=0.000e+00 dotRelErr=0.000e+00"},
+    {"name": "E_fp8_e5m2", "ran": true, "pass": true, "kernel_ms": -1.0000, "detail": "e5m2 N=4096 quantMismatch=0 maxBackDiff=0.000e+00 dotRelErr=0.000e+00"},
+    {"name": "F_wmma_f16", "ran": false, "pass": false, "kernel_ms": -1.0000, "detail": "WMMA test not compiled (needs gfx12 + -DWMMA_TEST=1)"}
+  ],
+  "overall_pass": true
+}

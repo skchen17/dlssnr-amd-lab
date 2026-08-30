@@ -1,0 +1,293 @@
+﻿clang++.exe : tools\hip_probe\hip_probe.cpp:240:5: warning: ignoring return value of type 'hipError_t' declared with 'n
+odiscard' attribute [-Wunused-value]
+所在位置 行:1 字符: 292
++ ... TH"; $out = & "$($e.hip_path)\lib\llvm\bin\clang++.exe" -x hip tools\ ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (tools\hip_probe...-Wunused-value]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  240 |     hipEventCreate(&t0); hipEventCreate(&t1);
+      |     ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:240:26: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  240 |     hipEventCreate(&t0); hipEventCreate(&t1);
+      |                          ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:241:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  241 |     hipEventRecord(t0);
+      |     ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:243:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  243 |     hipEventRecord(t1);
+      |     ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:245:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  245 |     float ms = 0.f; hipEventElapsedTime(&ms, t0, t1);
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:255:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  255 |     hipFree(da); hipFree(db); hipFree(dc);
+      |     ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:255:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  255 |     hipFree(da); hipFree(db); hipFree(dc);
+      |                  ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:255:31: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  255 |     hipFree(da); hipFree(db); hipFree(dc);
+      |                               ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:256:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  256 |     hipEventDestroy(t0); hipEventDestroy(t1);
+      |     ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:256:26: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  256 |     hipEventDestroy(t0); hipEventDestroy(t1);
+      |                          ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:287:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  287 |     hipMalloc(&dA, N * N * sizeof(half));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:288:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  288 |     hipMalloc(&dB, N * N * sizeof(half));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:289:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  289 |     hipMalloc(&dC, N * N * sizeof(half));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:290:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  290 |     hipMemcpy(dA, A.data(), N * N * sizeof(half), hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:291:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  291 |     hipMemcpy(dB, B.data(), N * N * sizeof(half), hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:294:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  294 |     hipEventCreate(&t0); hipEventCreate(&t1);
+      |     ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:294:26: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  294 |     hipEventCreate(&t0); hipEventCreate(&t1);
+      |                          ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:295:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  295 |     hipEventRecord(t0);
+      |     ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:298:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  298 |     hipEventRecord(t1);
+      |     ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:300:21: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  300 |     float ms = 0.f; hipEventElapsedTime(&ms, t0, t1);
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:303:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  303 |     hipMemcpy(C.data(), dC, N * N * sizeof(half), hipMemcpyDeviceToHost);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:310:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  310 |     hipFree(dA); hipFree(dB); hipFree(dC);
+      |     ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:310:18: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  310 |     hipFree(dA); hipFree(dB); hipFree(dC);
+      |                  ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:310:31: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  310 |     hipFree(dA); hipFree(dB); hipFree(dC);
+      |                               ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:311:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  311 |     hipEventDestroy(t0); hipEventDestroy(t1);
+      |     ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:311:26: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  311 |     hipEventDestroy(t0); hipEventDestroy(t1);
+      |                          ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:345:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  345 |     hipMalloc(&din, N * sizeof(float));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:346:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  346 |     hipMalloc(&dout, N * sizeof(float));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:347:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  347 |     hipMalloc(&dmid, N);
+      |     ^~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:348:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  348 |     hipMemcpy(din, in.data(), N * sizeof(float), hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:354:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  354 |     hipMemcpy(qgpu.data(), dmid, N, hipMemcpyDeviceToHost);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:355:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  355 |     hipMemcpy(out.data(), dout, N * sizeof(float), hipMemcpyDeviceToHost);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:370:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  370 |     hipMalloc(&dqa, N); hipMalloc(&dqb, N); hipMalloc(&dd, sizeof(float));
+      |     ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:370:25: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  370 |     hipMalloc(&dqa, N); hipMalloc(&dqb, N); hipMalloc(&dd, sizeof(float));
+      |                         ^~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:370:45: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  370 |     hipMalloc(&dqa, N); hipMalloc(&dqb, N); hipMalloc(&dd, sizeof(float));
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:371:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  371 |     hipMemcpy(dqa, qgpu.data(), N, hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:372:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  372 |     hipMemcpy(dqb, qb.data(), N, hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:374:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  374 |     hipMemcpy(dd, &zero, sizeof(float), hipMemcpyHostToDevice);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:378:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  378 |     hipMemcpy(&gpuDot, dd, sizeof(float), hipMemcpyDeviceToHost);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |     ^~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:19: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |                   ^~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:34: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |                                  ^~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:49: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |                                                 ^~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:63: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |                                                               ^~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:382:77: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  382 |     hipFree(din); hipFree(dout); hipFree(dmid); hipFree(dqa); hipFree(dqb); hipFree(dd);
+      |                                                                             ^~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:400:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  400 |     hipMalloc(&dOut, elems * sizeof(float));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:401:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  401 |     hipMemset(dOut, 0, elems * sizeof(float));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:405:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  405 |     hipMemcpy(out.data(), dOut, elems * sizeof(float), hipMemcpyDeviceToHost);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:406:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  406 |     hipFree(dOut);
+      |     ^~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:436:45: warning: 'fopen' is deprecated: This function or variable may be unsafe. Consider
+ using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [-Wdeprecated
+-declarations]
+  436 |     FILE* f = (path && strcmp(path, "-")) ? fopen(path, "w") : stdout;
+      |                                             ^
+C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stdio.h:212:20: note: 'fopen' has been explicitly mark
+ed deprecated here
+  212 |     _Check_return_ _CRT_INSECURE_DEPRECATE(fopen_s)
+      |                    ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:368:55: note
+: expanded from macro '_CRT_INSECURE_DEPRECATE'
+  368 |         #define _CRT_INSECURE_DEPRECATE(_Replacement) _CRT_DEPRECATE_TEXT(    \
+      |                                                       ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:358:47: note
+: expanded from macro '_CRT_DEPRECATE_TEXT'
+  358 | #define _CRT_DEPRECATE_TEXT(_Text) __declspec(deprecated(_Text))
+      |                                               ^
+tools\hip_probe\hip_probe.cpp:467:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  467 |             hipGetDeviceProperties(&p, 0);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\include\hip/hip_runtime_api.h:103:32: note: exp
+anded from macro 'hipGetDeviceProperties'
+  103 | #define hipGetDeviceProperties hipGetDevicePropertiesR0600
+      |                                ^
+tools\hip_probe\hip_probe.cpp:473:13: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' att
+ribute [-Wunused-value]
+  473 |             hipSetDevice(0);
+      |             ^~~~~~~~~~~~~~~
+tools\hip_probe\hip_probe.cpp:495:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attr
+ibute [-Wunused-value]
+  495 |         hipFree(d);
+      |         ^~~~~~~~~~
+fatal error: error in backend: Cannot select: intrinsic %llvm.amdgcn.wmma.f32.16x16x16.f16
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace, preprocesse
+d source, and associated run script.
+Stack dump:
+0.	Program arguments: C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\bin\\
+clang++.exe -cc1 -triple amdgcn-amd-amdhsa -aux-triple x86_64-pc-windows-msvc -O2 -Werror=atomic-alignment -emit-obj -m
+incremental-linker-compatible -dumpdir build\\hip_probe_wmma.exe- -disable-free -clear-ast-before-backend -disable-llvm
+-verifier -discard-value-names -main-file-name hip_probe.cpp -mrelocation-model pic -pic-level 2 -fhalf-no-semantic-int
+erposition -mframe-pointer=none -relaxed-aliasing -fno-rounding-math -mconstructor-aliases -aux-target-cpu x86-64 -fcud
+a-is-device -fno-threadsafe-statics -mllvm -amdgpu-internalize-symbols -fcuda-allow-variadic-functions -fvisibility=hid
+den -fapply-global-visibility-to-externs -mlink-builtin-bitcode C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-
+packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\ocml.bc -mlink-builtin-bitcode C:\\Users\\20426\\Documents\\Comfy
+UI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\ockl.bc -mlink-builtin-bitcode C:\\Users\\20
+426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\oclc_daz_opt_off.bc -ml
+ink-builtin-bitcode C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\
+\bitcode\\oclc_unsafe_math_off.bc -mlink-builtin-bitcode C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-package
+s\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\oclc_finite_only_off.bc -mlink-builtin-bitcode C:\\Users\\20426\\Documen
+ts\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\oclc_correctly_rounded_sqrt_on.bc -
+mlink-builtin-bitcode C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgc
+n\\bitcode\\oclc_wavefrontsize64_off.bc -mlink-builtin-bitcode C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-p
+ackages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\oclc_isa_version_1201.bc -mlink-builtin-bitcode C:\\Users\\20426\\
+Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\amdgcn\\bitcode\\oclc_abi_version_600.bc -tar
+get-cpu gfx1201 -debugger-tuning=gdb -fdebug-compilation-dir=C:\\DATA\\Python_File\\Qoder_workspace\\dlssnr-amd-lab -fc
+overage-compilation-dir=C:\\DATA\\Python_File\\Qoder_workspace\\dlssnr-amd-lab -resource-dir C:\\Users\\20426\\Document
+s\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\lib\\clang\\22 -internal-isystem C:\\Users\\20426\\Do
+cuments\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\lib\\clang\\22\\include\\cuda_wrappers -idiraft
+er C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-packages\\_rocm_sdk_core\\include -include __clang_hip_runtim
+e_wrapper.h -D WMMA_TEST=1 -D WMMA_TEST=1 -internal-isystem C:\\Users\\20426\\Documents\\ComfyUI\\.venv\\Lib\\site-pack
+ages\\_rocm_sdk_core\\lib\\llvm\\lib\\clang\\22\\include -internal-isystem "C:\\Program Files (x86)\\Microsoft Visual S
+tudio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\include" -internal-isystem "C:\\Program Files (x86)\\Microsoft Vis
+ual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\atlmfc\\include" -internal-isystem "C:\\Program Files (x86)\\
+Windows Kits\\10\\Include\\10.0.26100.0\\ucrt" -internal-isystem "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\1
+0.0.26100.0\\shared" -internal-isystem "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um" -internal
+-isystem "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\winrt" -internal-isystem "C:\\Program Files
+ (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\cppwinrt" -internal-isystem C:\\Users\\20426\\Documents\\ComfyUI\\.ven
+v\\Lib\\site-packages\\_rocm_sdk_core\\lib\\llvm\\lib\\clang\\22\\include -internal-isystem "C:\\Program Files (x86)\\M
+icrosoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\include" -internal-isystem "C:\\Program Files (x8
+6)\\Microsoft Visual Studio\\18\\BuildTools\\VC\\Tools\\MSVC\\14.50.35717\\atlmfc\\include" -internal-isystem "C:\\Prog
+ram Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt" -internal-isystem "C:\\Program Files (x86)\\Windows Kit
+s\\10\\Include\\10.0.26100.0\\shared" -internal-isystem "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100
+.0\\um" -internal-isystem "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\winrt" -internal-isystem "
+C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\cppwinrt" -std=c++20 -fdeprecated-macro -fno-autolink
+ -ferror-limit 19 -fhip-new-launch-api -fms-extensions -fms-compatibility -fms-compatibility-version=19.50.35728 -fno-i
+mplicit-modules -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -vectorize-loops -vectorize-slp -cuid=7a6ab988caa
+1501 -fcuda-allow-variadic-functions -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o C:\\Users\\20426\\AppData\\Local\\Temp\
+\hip_probe-gfx1201-52eeb5.o -x hip tools\\hip_probe\\hip_probe.cpp
+1.	<eof> parser at end of file
+2.	Code generation
+3.	Running pass 'CallGraph Pass Manager' on module 'tools\hip_probe\hip_probe.cpp'.
+4.	Running pass 'AMDGPU DAG->DAG Pattern Instruction Selection' on function '@_ZL24k_wmma_f16_ones_identityPf'
+clang++: error: clang frontend command failed with exit code 70 (use -v to see invocation)
+AMD clang version 22.0.0git (https://github.com/ROCm/llvm-project.git 6602f325c28907dba03c42fc0263c4a309529c52+PATCHED:
+93c451b46cc0dc23c47d67e394b370de65731aac)
+Target: x86_64-pc-windows-msvc
+Thread model: posix
+InstalledDir: C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm\bin
+clang++: note: diagnostic msg: Error generating preprocessed source(s).
+

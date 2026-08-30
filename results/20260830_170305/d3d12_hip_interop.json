@@ -1,0 +1,15 @@
+{
+  "d3d12_adapter": {"vendor": "0x1002", "device": "0x7550"},
+  "hip_device": "AMD Radeon RX 9070 XT gfx1201",
+  "import_kind": "D3D12Heap",
+  "tests": [
+    {"name": "T1_buffer_import", "ran": true, "pass": true, "informational": false, "kernel_ms": -1.0000, "detail": "imported D3D12Heap handle=0x00000000000003C4 devPtr=0000000304000000 size=4194304"},
+    {"name": "T1b_committed_resource", "ran": true, "pass": true, "informational": true, "kernel_ms": -1.0000, "detail": "D3D12Resource import -> 0 (ok)"},
+    {"name": "T2_fence_import", "ran": true, "pass": true, "informational": false, "kernel_ms": -1.0000, "detail": "fence imported"},
+    {"name": "T3_d3d12_to_hip", "ran": true, "pass": true, "informational": false, "kernel_ms": -0.7651, "detail": "n=1048576 mismatch=0 kernel=-0.7651ms"},
+    {"name": "T4_hip_to_d3d12", "ran": true, "pass": true, "informational": false, "kernel_ms": 0.0635, "detail": "n=1048576 mismatch=0 kernel=0.0635ms"},
+    {"name": "T5_texture_import", "ran": true, "pass": true, "informational": true, "kernel_ms": -1.0000, "detail": "import ok; GetMappedBuffer -> 0 (ok) ptr=0000000304440000"},
+    {"name": "T6_pass_b_cmdlist_api", "ran": true, "pass": false, "informational": true, "kernel_ms": -1.0000, "detail": "amdhip64.dll=absent probed=[] found=0; no public HIP API embeds HIP kernels in D3D12 command lists (ZLUDA FAQ capability targets CUDA Driver API; re-check at Phase 4 trace level). PASS-B fallback = separate HIP queue + external fence (proved in T3/T4 if PASS-A holds)."}
+  ],
+  "pass_a": true
+}

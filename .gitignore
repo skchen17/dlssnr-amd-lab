@@ -1,0 +1,48 @@
+# ==== Proprietary binaries: NEVER commit (NVIDIA/game files) ====
+*.dll
+*.exe
+*.bin
+*.cubin
+*.fatbin
+*.ptx
+!third_party/**/*.dll
+# Whitelist patterns above are intentionally restrictive; review before force-adding anything.
+
+# Explicitly forbidden proprietary artifacts
+nvngx_dlssnr.dll
+nvngx_dlss.dll
+nvngx.dll
+libxess.dll
+*_addon*.dll
+game_files/
+proprietary/
+*.elf
+results/**/carved_*
+results/**/*reference_package*
+
+# ==== Build outputs ====
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.user
+.vs/
+CMakeSettings.json
+CMakeUserPresets.json
+
+# ==== Large / binary results ====
+results/**/*.raw
+results/**/*.dds
+results/**/*.png
+results/**/*.jpg
+results/**/*.mp4
+
+# ==== Environment ====
+.env
+*.local.cfg

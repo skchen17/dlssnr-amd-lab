@@ -1,0 +1,14 @@
+=== nr_host (dlssnr-amd-lab Phase 5 skeleton) ===
+trace mode: set these env vars and rerun under the shims:
+  MODULE_TRACE_LOG=<path>  (inject build\module_trace.dll)
+  NVAPI_TRACE_LOG=<path>   (place build\nvapi64.dll as the game's nvapi64.dll)
+inputs: color=1048576B depth=1048576B motion=1048576B exposure=0.180 (deterministic LCG 0x2545F491)
+reference package written to results\20260830_182046_reference_package\ (copy to an NVIDIA machine)
+module_trace self-inject: 00007FFD2C2C0000 (lasterr=0)
+load: dlss=00007FFB9D5E0000 nr=00007FFB93790000 (lasterr dlss=0 nr=0)
+NGX exports (RECONSTRUCTED signatures): init=1 shutdown=1 create=1 eval=1 release=1; nr_dll=loaded
+adapter used for NGX init: vendor=0x1002 device=0x7550 (0x1002=AMD, 0x10DE=NVIDIA)
+NGX init (reconstructed): 0xbad00001 params=0000000000000000
+
+{"status": "NGX_INIT_FAILED", "frames": 1, "width": 512, "height": 512, "detail": "NGX init returned 0xbad00001 on vendor=0x1002 adapter (reconstructed signature)"}
+

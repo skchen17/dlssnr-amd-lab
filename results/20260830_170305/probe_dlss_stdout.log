@@ -1,0 +1,24 @@
+file  : ..\file\nvngx_dlss.dll
+size  : 58977904 bytes
+sha256: be6e434a94ca32499515eb62ca0e6c274526055d568d0426e4c652dcdfb6ee6e
+PE    : machine=0x8664 (AMD64) timestamp=1778821937 sections=7
+  sec .text    va=0x00001000 vsize=0x0012be3c raw=0x00000400 rawsz=0x0012c000 flags=0x60000020
+  sec .rdata   va=0x0012d000 vsize=0x0087fd68 raw=0x0012c400 rawsz=0x0087fe00 flags=0x40000040
+  sec .data    va=0x009ad000 vsize=0x02e9ed14 raw=0x009ac200 rawsz=0x02e85a00 flags=0xc0000040
+  sec .pdata   va=0x0384c000 vsize=0x000088b0 raw=0x03831c00 rawsz=0x00008a00 flags=0x40000040
+  sec _RDATA   va=0x03855000 vsize=0x000000f4 raw=0x0383a600 rawsz=0x00000200 flags=0x40000040
+  sec .rsrc    va=0x03856000 vsize=0x00000528 raw=0x0383a800 rawsz=0x00000600 flags=0x40000040
+  sec .reloc   va=0x03857000 vsize=0x000016c8 raw=0x0383ae00 rawsz=0x00001800 flags=0x42000040
+  import VERSION.dll: 3 funcs
+  import ADVAPI32.dll: 3 funcs
+  import USER32.dll: 1 funcs
+  import KERNEL32.dll: 114 funcs
+  .rsrc present: size=1320
+elf payloads: 670 found (670 with EM_CUDA=190)
+ptx_target: 16 occurrence(s), e.g. ".target sm_89
+"
+ptx_version: 8 occurrence(s), e.g. ".version 8.7
+"
+no high-entropy runs >= 256KB (weights may be low-entropy fp16/fp8 tables)
+manifest written: C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\results\20260830_170305\binary_manifest_dlss.json
+

@@ -1,0 +1,5 @@
+{"ev":"backend","ts":23420757.567,"pid":39192,"shim":"C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\build\nvapi64.dll","real":"C:\Windows\system32\nvapi64.dll","real_loaded":false,"real_query":false}
+{"ev":"resolve","ts":23420757.658,"tid":35468,"id":"0x0150e828","name":"NvAPI_Initialize","src":"nvapi.h","real_ptr":0,"stub":2637082132480,"cu_family":false}
+{"ev":"resolve","ts":23420757.701,"tid":35468,"id":"0x162bd2e5","name":"NvAPI_D3D12_CreateCuModule?(community)","src":"community","real_ptr":0,"stub":2637082132528,"cu_family":true}
+{"ev":"call","ts":23420757.744,"tid":35468,"id":"0x0150e828","name":"NvAPI_Initialize","src":"nvapi.h","arg1":3735928559,"arg1_magic":"unreadable"}
+{"ev":"ret","ts":23420757.868,"tid":35468,"id":"0x0150e828","ret":-1,"ret_hex":"0xffffffff","dt_ms":0.124}

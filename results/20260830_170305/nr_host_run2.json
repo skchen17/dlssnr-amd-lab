@@ -1,0 +1,1 @@
+{"status": "BLOCKED_MISSING_PREREQUISITE", "frames": 1, "width": 512, "height": 512, "detail": "nvngx_dlss.dll missing (set DLSS_DLL_PATH)"}

@@ -1,0 +1,252 @@
+﻿HIP SDK  : C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core
+Win SDK  : C:\Program Files (x86)\Windows Kits\10\ (10.0.26100.0)
+MSVC     : C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools (14.50.35717)
+
+== Building d3d12_hip_interop (HIP, gfx1201) ==
+  cmd: clang++ -x hip C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp --offload-arch=gfx1201 --rocm-path=C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\lib\llvm --hip-link -O2 -std=c++20 -isystem C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\ucrt -isystem C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\shared -isystem C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\um -isystem C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\winrt -o C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\build\d3d12_hip_interop.exe -fuse-ld=lld -LC:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\lib -LC:\Program Files (x86)\Windows Kits\10\\Lib\10.0.26100.0\ucrt\x64 -LC:\Program Files (x86)\Windows Kits\10\\Lib\10.0.26100.0\um\x64 -LC:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\lib\x64 -ldxgi -ld3d12 -lole32 -luser32
+powershell : C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:143:5: wa
+rning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+所在位置 行:1 字符: 56
++ ... nr-amd-lab; powershell -NoProfile -ExecutionPolicy Bypass -File scrip ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\DATA\Python_...-Wunused-value]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  143 |     hipGetDeviceProperties(&hp, 0);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\include\hip/hip_runtime_api.h:103:32: note: exp
+anded from macro 'hipGetDeviceProperties'
+  103 | #define hipGetDeviceProperties hipGetDevicePropertiesR0600
+      |                                ^
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:144:5: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  144 |     hipSetDevice(0);
+      |     ^~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:306:26: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  306 |                 if (em2) hipDestroyExternalMemory(em2);
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:425:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  425 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:425:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  425 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:426:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  426 |         hipEventRecord(e0, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:429:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  429 |         hipEventRecord(e1, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:431:25: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  431 |         float ms = 0.f; hipEventElapsedTime(&ms, e0, e1);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:435:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  435 |         hipMemcpy(&mismatch, dMismatch, sizeof(uint32_t), hipMemcpyDeviceToHost);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:441:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  441 |         hipFree(dMismatch);
+      |         ^~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:442:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  442 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:442:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  442 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:443:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  443 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:460:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  460 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:460:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  460 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:461:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  461 |         hipEventRecord(e0, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:464:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  464 |         hipEventRecord(e1, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:479:25: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  479 |         float ms = 0.f; hipEventElapsedTime(&ms, e0, e1);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:481:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  481 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:481:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  481 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:482:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  482 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:558:21: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  558 |                     hipDestroyExternalMemory(em5);
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:602:19: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  602 |     if (extFence) hipDestroyExternalSemaphore(extFence);
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:603:17: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  603 |     if (extMem) hipDestroyExternalMemory(extMem);  // releases HIP side only
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:613:43: warning: 'fope
+n' is deprecated: This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use 
+_CRT_SECURE_NO_WARNINGS. See online help for details. [-Wdeprecated-declarations]
+  613 |         FILE* f = strcmp(jsonPath, "-") ? fopen(jsonPath, "w") : stdout;
+      |                                           ^
+C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\ucrt\stdio.h:212:20: note: 'fopen' has been explicitly mar
+ked deprecated here
+  212 |     _Check_return_ _CRT_INSECURE_DEPRECATE(fopen_s)
+      |                    ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:368:55: note
+: expanded from macro '_CRT_INSECURE_DEPRECATE'
+  368 |         #define _CRT_INSECURE_DEPRECATE(_Replacement) _CRT_DEPRECATE_TEXT(    \
+      |                                                       ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:358:47: note
+: expanded from macro '_CRT_DEPRECATE_TEXT'
+  358 | #define _CRT_DEPRECATE_TEXT(_Text) __declspec(deprecated(_Text))
+      |                                               ^
+25 warnings generated when compiling for gfx1201.
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:143:5: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  143 |     hipGetDeviceProperties(&hp, 0);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\Users\20426\Documents\ComfyUI\.venv\Lib\site-packages\_rocm_sdk_core\include\hip/hip_runtime_api.h:103:32: note: exp
+anded from macro 'hipGetDeviceProperties'
+  103 | #define hipGetDeviceProperties hipGetDevicePropertiesR0600
+      |                                ^
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:144:5: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  144 |     hipSetDevice(0);
+      |     ^~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:306:26: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  306 |                 if (em2) hipDestroyExternalMemory(em2);
+      |                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:425:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  425 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:425:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  425 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:426:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  426 |         hipEventRecord(e0, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:429:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  429 |         hipEventRecord(e1, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:431:25: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  431 |         float ms = 0.f; hipEventElapsedTime(&ms, e0, e1);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:435:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  435 |         hipMemcpy(&mismatch, dMismatch, sizeof(uint32_t), hipMemcpyDeviceToHost);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:441:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  441 |         hipFree(dMismatch);
+      |         ^~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:442:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  442 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:442:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  442 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:443:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  443 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:460:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  460 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:460:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  460 |         hipEventCreate(&e0); hipEventCreate(&e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:461:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  461 |         hipEventRecord(e0, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:464:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  464 |         hipEventRecord(e1, stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:479:25: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  479 |         float ms = 0.f; hipEventElapsedTime(&ms, e0, e1);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:481:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  481 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |         ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:481:30: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  481 |         hipEventDestroy(e0); hipEventDestroy(e1);
+      |                              ^~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:482:9: warning: ignori
+ng return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  482 |         hipStreamDestroy(stream);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:558:21: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  558 |                     hipDestroyExternalMemory(em5);
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:602:19: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  602 |     if (extFence) hipDestroyExternalSemaphore(extFence);
+      |                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:603:17: warning: ignor
+ing return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  603 |     if (extMem) hipDestroyExternalMemory(extMem);  // releases HIP side only
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\tools\d3d12_hip_interop\d3d12_hip_interop.cpp:613:43: warning: 'fope
+n' is deprecated: This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use 
+_CRT_SECURE_NO_WARNINGS. See online help for details. [-Wdeprecated-declarations]
+  613 |         FILE* f = strcmp(jsonPath, "-") ? fopen(jsonPath, "w") : stdout;
+      |                                           ^
+C:\Program Files (x86)\Windows Kits\10\\Include\10.0.26100.0\ucrt\stdio.h:212:20: note: 'fopen' has been explicitly mar
+ked deprecated here
+  212 |     _Check_return_ _CRT_INSECURE_DEPRECATE(fopen_s)
+      |                    ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:368:55: note
+: expanded from macro '_CRT_INSECURE_DEPRECATE'
+  368 |         #define _CRT_INSECURE_DEPRECATE(_Replacement) _CRT_DEPRECATE_TEXT(    \
+      |                                                       ^
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\include\vcruntime.h:358:47: note
+: expanded from macro '_CRT_DEPRECATE_TEXT'
+  358 | #define _CRT_DEPRECATE_TEXT(_Text) __declspec(deprecated(_Text))
+      |                                               ^
+25 warnings generated when compiling for host.
+  -> C:\DATA\Python_File\Qoder_workspace\dlssnr-amd-lab\build\d3d12_hip_interop.exe
+
+All requested builds finished.
+

@@ -1,0 +1,1 @@
+{"status": "NGX_INIT_FAILED", "frames": 1, "width": 512, "height": 512, "detail": "NGX init returned 0xbad00001 on vendor=0x1002 adapter (reconstructed signature)"}
