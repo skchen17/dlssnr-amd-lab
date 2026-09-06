@@ -1,5 +1,11 @@
 # FINAL_REPORT.md — Round 1 最终交付报告
 
+> **历史报告 / 已被后续实验校正：** 本文保留 Round 1 当时的观测。文中所有
+> “纯 SASS / 无 PTX / PTX path BLOCKED”结论已由 2026-08-31 的容器解压实验
+> 推翻：15/15 运行时容器均含 PTX 9.4/sm_120，共 231 个入口；原始
+> `cc_cb_clear` PTX 已通过 ZLUDA 在 RX 9070 XT 上实际执行并回读零误差。
+> 当前状态以 `docs/STATUS.md`、`docs/BINARY_ANALYSIS.md` 和 R-24..R-26 为准。
+
 日期: 2026-08-30 · 运行目录: `results/20260830_170305/` · 机器: RX 9070 XT (gfx1201, 0x1002/0x7550)
 
 本报告对应规范第二十一节。所有结论均可由文内给出的命令、日志路径或可重复实验支持；
@@ -83,7 +89,7 @@ binary_probe 找 fatbin → 查 PTX 标记 → 核对工具链支持 → 单 ker
 
 ### 9. AMD D3D12/HIP interop 状态
 
-**PROVEN（S2）。** 证据 `results/20260830_170305/d3d12_hip_interop.json`：
+**PASS-A（S2）。** 证据 `results/20260830_170305/d3d12_hip_interop.json`：
 - `hipImportExternalMemory`（D3D12Heap=4 / D3D12Resource=5）导入共享 buffer：OK
 - `hipExternalSemaphoreHandleTypeD3D12Fence` 导入共享 fence：OK
 - T3 D3D12→HIP、T4 HIP→D3D12 双向传输内容校验 mismatch=0
@@ -107,7 +113,8 @@ binary_probe 找 fatbin → 查 PTX 标记 → 核对工具链支持 → 单 ker
 2. 若 NVAPI Cubin 系：`NvAPI_D3D12_CreateCuModule/EnumFunctionsInModule/CreateCuFunction/
    LaunchCuKernelChain(Ex)` 等 12+ 函数的参数块布局（nvapi_ids.h 已备社区 ID，带 ? 待实证）。
 3. 若 CUDA Driver API：cuModuleLoad/cuLaunchKernel 族 → ZLUDA 覆盖度需对实际负载验证。
-4. NGX 官方参数块（feature 18 的 Create/Evaluate 参数）→ 当前为重建签名（B-4）。
+4. NGX 参数块 → Round 2 已接入官方头（`third_party/nvidia-dlss`，docs/NGX_ABI_AUDIT.md）；
+   feature 18 的 Create/Evaluate 参数仍属 PRIVATE ABI（`tools/nr_host/private_ngx_compat.h`），待 reference trace 确认。
 5. WMMA/MMA 快路径：ROCm 7.2 LLVM 的 `wmma.f32.16x16x16.f16` ISel 缺陷（S-B4），
    备选：f16 累加变体 / inline asm / 新 LLVM。
 
@@ -191,7 +198,8 @@ vendor/device/LUID + kernel launch log。
 用户合法提供了两个 DLL（台账：docs/PROPRIETARY_FILES.md），上文第 5–8、12–14 项与
 A–E 的回答相应更新如下（详细证据见 R-5/R-6 与 docs/BINARY_ANALYSIS.md）：
 
-1. **S-level：S3 ACHIEVED（静态）**。S5 首次接触后阻塞于 NGX vendor gate（0xbad00001）。
+1. **S-level：S3A PASS（静态）/ S3B NOT ACHIEVED（动态）**。S5 首次接触后阻塞于 NGX init 拒绝
+   （0xBAD00001 = FAIL_FeatureNotSupported；规范措辞见下方第 5 条与 Round 2 章节）。
 2. **binary analysis（原第 5 项，已解锁）**：NR payload = `.rsrc` 内 **15 个纯 SASS
    CUBIN 模块（e_machine=190）**，目标 **sm_120（Blackwell）独占**，全文件 **零 PTX**；
    kernel 名与 `.nv.info` 参数 metadata 完整保留（fused Swin-Transformer 骨干，
@@ -200,21 +208,84 @@ A–E 的回答相应更新如下（详细证据见 R-5/R-6 与 docs/BINARY_ANAL
    **PTX path = BLOCKED**，不假装 ZLUDA 可执行 SASS，进入 Track B（但因 kernel 名/
    metadata 完整，Track B 起点远好于黑盒）。
 4. **call graph（原第 6 项）**：静态链路已定（nr_host→NGX→dlssnr→[模块加载/发射 API]→
-   15×CUBIN）；动态发射端证据被 vendor gate 挡住，倾向 CASE A（CUBIN 模块路线，
-   与 RTX-40 patch=CUBIN 替换的社区证据一致），待过门后由 trace 实锤。
+   15×CUBIN）；动态发射端证据被 init 拒绝挡住。Round 1 的"倾向 CASE A"**已撤回**
+   （docs/CALLGRAPH.md 记 UNDECIDED），CASE 判定改由 R6/R7 reference trace 裁决。
 5. **第一个真正 blocker（原第 12 项）已前移**：S-B5 —— NGX init 在 AMD 设备上返回
-   0xbad00001（真实 vendor/硬件能力检查，先于一切 nvapi/cuda 调用）。按规范，
-   骗过该检查永远不算成功证据；只允许作为**明确标注的 trace 观察手段**。
+   0xBAD00001（= FAIL_FeatureNotSupported，先于一切 nvapi/cuda 调用）。Round 2 在
+   **官方 ABI** 下复现同一结果（E-7）；其是否为专门的 vendor/硬件门 **UNCONFIRMED**
+   （缺 RTX 阳性对照）。按规范，骗过该检查永远不算成功证据；只允许作为**明确标注的
+   trace 观察手段**（且须先通过 Round 2 规定的官方 ABI + reference + tracer 三重验证）。
 6. **首次真实动态接触**：未修改的两个 DLL 在 AMD 机上干净加载、5 个重建 NGX 导出
    全部解析成功、NGX init 真实执行并干净拒绝（未崩溃）—— E-6。
+   Round 2 更正：该次运行所用重建 ABI 经审计为无效（docs/NGX_ABI_AUDIT.md E1/E3），
+   已按官方 ABI 重跑，结果一致（E-7）。
 
 **A–E 更新回答**：
-- A：依旧没有任何欺骗。0xbad00001 恰是 runtime 真实识别出非 NVIDIA 硬件的证据。
-- B：依旧**没有**执行任何 DLSSNR 神经网络计算（被 vendor gate 合法拒绝）。
+- A：依旧没有任何欺骗。0xBAD00001（FAIL_FeatureNotSupported）是 runtime 干净拒绝
+  AMD 适配器的观察事实；其是否为专门的 vendor/硬件门待 RTX 阳性对照确认（UNCONFIRMED）。
+- B：依旧**没有**执行任何 DLSSNR 神经网络计算（init 即被拒绝，未达任何 launch API）。
 - C：不适用。已证明的 AMD 事实仍为 S1/S2 探针（0x1002/0x7550）。
-- D：现在差两层——(1) 过 vendor gate（观察用）拿到发射端 API 清单；
+- D：现在差两层——(1) 越过 init 拒绝（仅限观察用，且须先通过 Round 2 三重验证）拿到发射端 API 清单；
   (2) 按 Track B+CASE A 机制提供 15 个 sm_120 SASS 的 AMD 等价 kernel（HSACO）。
 - E：**下一步 = 过门观察 + Track B 启动**：以标注清晰的 trace-aid（如 DXGI 适配器
   代理，仅观察）拿到 nvapi_QueryInterface/模块加载全链，确认发射 API；同时按已提取的
   kernel 清单在 HIP 上重建第一个算子（建议从最小的 `post_block` 融合 kernel 起步）。
   仍需用户在任一 RTX 机器上跑 `run_reference.ps1` 产出真 reference（B-3 未解）。
+
+---
+
+# 增补：Round 2 —— 实验仪器校准（Phases A–I，2026-08-30 夜）
+
+本轮按规范暂停 AMD kernel reconstruction 与 vendor spoof 主路线，只做一件事：把动态实验链修正为 **ABI 正确、可在 NVIDIA reference 机器验证、可可靠 trace** 的实验系统。交付明细见 STATUS.md Log（Round 2 A–G）与 RESULTS.md R-7…R-12。以下回答规范 A–G 七问。
+
+**A. 0xbad00001 的定性（在官方 ABI 下）**
+结论：**观察事实 = `NVSDK_NGX_Result_FAIL_FeatureNotSupported`（Fail|1）干净拒绝；"专门的 vendor/硬件门"这一定性仍 UNCONFIRMED。** Round 2 换用官方头（`third_party/nvidia-dlss`，NVIDIA/DLSS @ a291cc7d2cc6）后，snippet 4 参与 loader 5 参两种 Init 变体在 AMD 适配器（0x1002/0x7550）上均返回 0xBAD00001，与 Round 1 重建 ABI 的观察一致——Round 1 结论在正确 ABI 下复现（E-7）。但本机无法产出阳性对照（RTX 上同链应返回 NVSDK_NGX_Result_Success），故不得宣称"已证明是 vendor 门"。
+命令与日志：`powershell -File scripts\run_nr_host_official_abi.ps1`（即 `build\nr_host.exe --frames 2 --force-load`，设 `DLSS_DLL_PATH`）；输出 `results/20260830_205123_nr_host_r2/nr_host_r2.json`（`{"status":"NGX_INIT_FAILED","result":"0xbad00001","abi":"official_loader"}`，exit=6）与 `nr_host_r2_stdout.log`。ABI 审计全文：`docs/NGX_ABI_AUDIT.md`。
+
+**B. Create/Evaluate/Release 是否真实？**
+结论：**代码层面已真实实现，但本机只走到 Init 即被拒绝，未到 Create。** nr_host 已重写为真 NGX host（静态链 `nvsdk_ngx_d.lib`，全官方签名）：Init→GetCapabilityParameters/AllocateParameters→CreateFeature(DLSS/DLAA)→真纹理上传→command list 记录 EvaluateFeature→ExecuteCommandLists→readback→ReleaseFeature→Shutdown，每步独立机读状态。契约依据 DLSS5-Feeder（MIT）已验证的合成 DLAA contract。无 NVIDIA GPU，Create 之后的路径在 RTX 上才能行使（见 C）。
+命令与日志：`scripts\build_all.ps1 -Only nr_host`；代码 `tools/nr_host/nr_host.cpp`（官方 ABI）+ `tools/nr_host/private_ngx_compat.h`（feature 18 隔离，标 PRIVATE ABI — inferred）。
+
+**C. NVIDIA vanilla DLSS/DLAA evaluate（R4）**
+结论：**BLOCKED_EXTERNAL_HARDWARE。** 本机无 NVIDIA GPU，无法产出真 reference。已交付一条命令管线：环境检测→runtime hash→Stage A（vanilla `nvngx_dlss.dll`）→Stage B（DLSSNR+addon）→trace capture→打包；本机正确产出 `reference_bundle/20260830_201313/`（manifest 记 `overall = BLOCKED_EXTERNAL_HARDWARE`，不含任何专有 DLL）。RTX 机器上执行：`powershell -ExecutionPolicy Bypass -File scripts\run_nvidia_reference.ps1`。
+
+**D. DLSS5 链路（addon→feature 18→inline NR，R5）**
+结论：**NOT RUN（依赖 C）。** Stage A/B 已分离，Stage B 预留 `DLSSNR_DLL_PATH` + `RENODX_DLSS5_ADDON_PATH`/DLSS5-Feeder 入口；四源合一要求（addon log + module trace + NGX/feature trace + GPU 执行证据）已写入管线，但本机无 NVIDIA GPU 无法执行，不虚构。
+
+**E. launch API 是什么（CASE 判定，R6）**
+结论：**未知，保持 UNDECIDED。** Round 1 的"LEANING CASE A"已撤回（docs/CALLGRAPH.md）。仪器侧已就绪：module_trace v2（同步门 + GetProcAddress 拦截，selftest READY）与 nvapi_trace（纯透传 trampoline，1..10 参字节一致自证）；待 R6 reference trace 裁决。
+命令与日志：`scripts\run_module_trace_selftest.ps1` → `results/20260830_202221_module_trace_selftest/`（READY）；`scripts\run_nvapi_trampoline_test.ps1` → `results/20260830_203207_nvapi_trampoline_test/nvapi_trampoline_test.jsonl`（PROVED）。
+
+**F. 15 个 CUBIN 是否被观测加载/发射？**
+结论：**没有。** init 拒绝先于任何模块加载/发射活动；静态分析（15×sm_120 CUBIN，docs/BINARY_ANALYSIS.md）不变。观测需先过 C；trace 仪器（E）已就位。
+
+**G. 是否具备进入 Track B 的条件？**
+结论：**具备（带保留）。** 已就位：官方 ABI 接入与回归测试（`scripts\run_ngx_abi_probe.ps1` → `results/20260830_200256/ngx_abi_test.json`，compile_time+runtime 双 PASS，确认 DLL 为 snippet 表面 59 导出）；可信 tracer（E）；S1 计算基线与 S2 buffer 互操作。保留：① 纹理直读不可用——Phase G 门（`scripts\run_texture_interop_test.ps1` → `results/20260830_203555_texture_interop/texture_interop.json`：四格式 roundtrip 字节一致、但 D3D12→HIP 线性读失败，AMD 纹理内存为 swizzled，`gate_pass=false, roundtrip_pass=true, layout_identity=false`），Track B 的纹理搬运必须走 swizzle-aware 寻址或 buffer staging；② vendor-gate 定性未确认（A），任何 trace-aid 观察须先满足三重验证前提；③ 规范已暂停 Track B 重建主路线，本轮不启动。
+
+**本轮交付清单（代码/工具）**：`third_party/nvidia-dlss` + `third_party/DLSS5-Feeder`（PROVENANCE.md 记录来源）；`docs/NGX_ABI_AUDIT.md`；`tools/nr_host/private_ngx_compat.h`；`tools/ngx_abi_probe/`；重写 `tools/nr_host/nr_host.cpp`；`tools/module_trace` v2 + `tests/module_trace_selftest/`；`tools/nvapi_trace` v2 + `tests/nvapi_trampoline_test/`；`tests/texture_interop_test/`；`scripts/run_nvidia_reference.ps1` 与四个自测 runner；`reference_bundle/`。
+
+**诚实声明**：本轮没有任何 DLSSNR 神经网络计算在任何 GPU 上执行；没有任何 vendor spoof；所有依赖 RTX 的目标均标 BLOCKED_EXTERNAL_HARDWARE 并交付可执行的 bundle 与命令。
+
+---
+
+# 增补：RTX 图闭环与 AMD 传输实验（2026-08-31）
+
+后续 RTX 5070/driver 610.88 实验已解除 Round 2 的 reference 阻塞。R-17
+真实创建并评估了私有 feature 18；R-19/R-20 以 NVIDIA R610 官方接口定义确认
+CASE A，并观测到 9 个 CuModule、96 个 CuFunction 与每帧 156 次单 kernel
+`LaunchCuKernelChain`。R-21 又完整捕获五帧，证明结构完全相同，得到 43 个实用
+函数的精确顺序、launch geometry、参数大小与参数字节。因此当前状态更新为
+**S3B PASS-GRAPH、S4 PASS**；本节结论取代前文历史阶段中的
+“S3B NOT ACHIEVED / CASE UNDECIDED / RTX blocked”。
+
+R-22 在本机 RX 9070 XT (`gfx1201`, DXGI `0x1002:0x7550`) 上启动 Track B：
+实验重建了 9/96 句柄生命周期，按 R-21 geometry 提交全部 156 槽，并把 11,624
+字节原始参数上传到 AMD 显存，由 HIP kernel 逐槽计算哈希。执行顺序与全部哈希
+均零不匹配。该结果只证明 AMD 调度、生命周期和参数承载基础设施，分类为
+`LAB_TRANSPORT_ONLY`；运行的是实验室 marker kernel，不含神经数学，故
+`counts_as_s6=false`，S5/S6 均未达成。
+
+当前实际断点已经变为：对 `sm_120` 纯 SASS、无 PTX 的 43 个实用 kernel 做
+clean-room HIP 重建并取得可比较的张量参考。下一项限定实验先验证 slot 0
+`cc_cb_clear` 的 16 字节边界 ABI，再验证末尾 `cg2r_copy_kernel`；两者即使通过
+也只是资源/参数管线证据，首个经数值参考确认的神经算子才可推进 S6。

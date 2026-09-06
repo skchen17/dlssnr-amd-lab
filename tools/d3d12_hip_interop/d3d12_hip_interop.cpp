@@ -254,9 +254,13 @@ int main(int argc, char** argv) {
         t1.pass = false;
     }
     if (t1.pass && sharedDevPtr) {
-        char b[160];
-        snprintf(b, sizeof(b), "imported %s handle=0x%p devPtr=%p size=%llu",
-                 importKind, (void*)heapSharedHandle, sharedDevPtr,
+        D3D12_GPU_VIRTUAL_ADDRESS d3d12Va = placedBuf->GetGPUVirtualAddress();
+        bool addressIdentity = d3d12Va == (D3D12_GPU_VIRTUAL_ADDRESS)(uintptr_t)sharedDevPtr;
+        char b[256];
+        snprintf(b, sizeof(b),
+                 "imported %s handle=0x%p d3d12VA=0x%llx hipPtr=%p address_identity=%s size=%llu",
+                 importKind, (void*)heapSharedHandle, (unsigned long long)d3d12Va,
+                 sharedDevPtr, addressIdentity ? "true" : "false",
                  (unsigned long long)BUF_SIZE);
         t1.detail += b;
     }

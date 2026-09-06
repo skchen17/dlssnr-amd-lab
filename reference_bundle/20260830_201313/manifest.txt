@@ -1,0 +1,11 @@
+﻿round 2 reference bundle (no proprietary DLLs inside)
+
+timestamp = 20260830_201313
+nvidia_gpu_present = False
+stage_abi_probe = NOT_RUN
+stage_a = NOT_RUN
+stage_b = NOT_RUN
+overall = BLOCKED_EXTERNAL_HARDWARE
+
+input determinism: LCG seed 0x2545F491; color RGBA8 / depth R32F / MV R16G16F
+contract source: DLSS5-Feeder (MIT) genuine DLAA contract; ABI: docs/NGX_ABI_AUDIT.md

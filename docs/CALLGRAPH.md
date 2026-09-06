@@ -3,15 +3,31 @@
 DLSSNR real call chain — decision tree for Phase 6 (case selection) and Phase 7
 (go/no-go). Updated 2026-08-30 after proprietary files became available:
 static payload analysis is complete (docs/BINARY_ANALYSIS.md); dynamic trace
-progressed to the first real load on AMD, which stopped at the NGX vendor gate
-(0xbad00001) — so launch-side API evidence is still pending.
+progressed to real loads on AMD and an RTX 5060. With corrected DLSS5-Feeder IDs,
+RTX passes NGX Init and the complete public DLAA path while AMD still returns
+`0xBAD00001`. Round 3 completed 8/8 Evaluate calls plus readback and observes the
+public support chain through driver NGX, DLSS, NVAPI, and CUDA modules. A later
+RTX 5070 reference run proves the private high-level chain: RenoDX hooks NGX
+Create/Evaluate, initializes signed DLSSNR 310.8, creates feature 18, and evaluates
+it inline. R-18 traces that successful private path and observes D3D12 plus system
+NVAPI (`nvapi_QueryInterface` and `nvapi_Direct_GetMethod`) but no classic CUDA
+Driver API module/export resolution after DLSSNR loads. R-19 then captures the
+exact official CreateCuModule/CreateCuFunction/LaunchCuKernelChain/Destroy IDs.
+R-20 wraps those typed interfaces and records nine real modules, 96 named
+functions and 46,800 successful single-kernel chains (300 frames × 156 calls),
+followed by clean destruction. CASE A is now proven at invocation level; the
+complete 156-call order and parameter bytes were captured by R-21 across five
+structurally identical frames. The reference graph is closed for the tested
+640x360/variant-02 configuration. R-22 replays that complete launch envelope on
+RX 9070 XT with a lab HIP marker backend and validates device-side parameter
+carriage; this proves the AMD transport scaffold, not neural execution.
 
 ## 1. Hypothesized chain (pre-trace, for reference only)
 
 ```
 nr_host (our D3D12 host, tools/nr_host)
-  -> NVSDK_NGX_D3D12_Init / CreateFeature (feature id 18 = Neural Rendering,
-     RECONSTRUCTED signatures — see nr_host.cpp header)
+  -> NVSDK_NGX_D3D12_Init / CreateFeature (public DLSS/DLAA host contract;
+     feature id 18 remains PRIVATE ABI and is not called directly by nr_host)
   -> nvngx.dll (driver-side NGX loader)
      -> nvngx_dlssnr.dll (feature plugin)
         -> ??? one of CASE A / B / C / D (Section 2)
@@ -53,40 +69,48 @@ Q4: any D3D12 MetaCommand / new neural-API evidence (DispatchRays-only graph,
   NO  -> CASE X (unknown): stop, capture raw traces, escalate. Never guess.
 ```
 
-Decision record (2026-08-30, from first real load + static analysis):
+Decision record (2026-08-30, updated by the successful R-18 private-path trace):
 
 | Question | Evidence file | Result |
 |---|---|---|
-| Q1 nvcuda load / cuda imports | binary_manifest_dlssnr.json + forcload module_trace | **NO**: no nvcuda import (static/delay); no nvcuda load observed. Post-gate unknown (init died before). |
-| Q2 nvapi Cubin family IDs | nvapi_trace | not reached — no nvapi call before vendor gate |
-| Q3 nvapi launch-chain IDs | nvapi_trace | not reached — same |
-| Q4 MetaCommand / new API | D3D12 debug layer + module_trace | not reached — same |
-| **Selected case** | static payload evidence | **LEANING CASE A** (CUBIN module payload + no CUDA-driver imports + RTX-40 patch = CUBIN-swap precedent); runtime confirmation PENDING vendor-gate passage |
+| Q1 nvcuda load / cuda imports | binary manifest + R-16/R-18 traces | Public DLSS loads `nvcuda64.dll`/`cuGetExportTable`; the isolated successful Feature-18 path in R-18 does **not**. DLSSNR also has no static/delay nvcuda import. Pure CASE B is rejected for this run. |
+| Q2 NVAPI Cubin family IDs | R-18 module/export trace | System `nvapi64.dll` is active and both `nvapi_QueryInterface` and private `nvapi_Direct_GetMethod` are resolved. Individual IDs were not wrapped by v6. |
+| Q3 NVAPI launch-chain IDs | R-19 QueryInterface-ID trace + NVIDIA R610 headers | **YES** — `AD1A677D` CreateCuModule, `E2436E22` CreateCuFunction, `24973538` LaunchCuKernelChain, `DF295EA6` DestroyCuFunction, `41C65285` DestroyCuModule. |
+| Q4 MetaCommand / new API | D3D12 debug layer + R-18 module trace | no positive MetaCommand evidence; ordinary D3D12 dependencies are present. |
+| **Selected case** | R-21/E-17 | **CASE A PROVEN AT GRAPH LEVEL** — typed D3D12 NVAPI calls execute a stable 156-slot frame; module/function/order/geometry/parameter bytes are captured and classic CUDA is absent. |
 
 First dynamic fact (AMD side, unmodified DLLs, no spoofing):
 `nr_host --force-load` loaded both DLLs (dlss@0x7FFB9D5E0000, nr@0x7FFB93790000),
-resolved all 5 reconstructed NGX exports, created a D3D12 device on vendor=0x1002
-and called `NVSDK_NGX_D3D12_Init`, which returned **0xbad00001** (hardware/vendor
-not supported) — the runtime executed a REAL capability check and rejected the AMD
-adapter cleanly, loading no NVIDIA support modules beforehand.
+resolved the NGX exports, created a D3D12 device on vendor=0x1002 and called
+`NVSDK_NGX_D3D12_Init`, which returned **0xbad00001** =
+`NVSDK_NGX_Result_FAIL_FeatureNotSupported`. Round 1 made this call through a
+RECONSTRUCTED ABI (later audited as invalid — docs/NGX_ABI_AUDIT.md E1/E3);
+Round 2 re-ran it under the official ABI and got the same result. R-15 then used
+the same corrected Feeder identifiers on RTX and reached Init/CreateFeature
+success, confirming an adapter-dependent NVIDIA support gate on AMD. No NVIDIA
+support modules load on AMD before that rejection; on RTX the public DLSS path
+loads NGX, DLSS, NVAPI, and CUDA support modules before Evaluate validation fails.
 Evidence: results/20260830_170305/nr_host_forceload_stdout.log,
-forcload_20260830_182045_module_trace.log.
+forcload_20260830_182045_module_trace.log,
+results/20260830_231421_rtx5060_v2/, docs/NGX_ABI_AUDIT.md (Post-script).
 
 ## 3. Evidence-driven replacement points
 
 | Link | Replace with (AMD) | Status | Evidence |
 |---|---|---|---|
-| nvapi64.dll CUBIN APIs (CASE A) | nvapi_amd shim -> HIP/HSACO dispatch; reuse build\nvapi64.dll trace shim as skeleton | not started | trace pending |
-| nvcuda.dll Driver API (CASE B/C) | ZLUDA nvcuda replacement (active project; known RDNA4+Windows issues, see RESEARCH.md) | not started | trace pending |
-| GPU binary payload | PTX -> ZLUDA -> LLVM AMDGPU -> HSACO (gate in Section 4) | **gated** | binary_probe pending |
-| D3D12 <-> compute sync | HIP external semaphore / fence interop | **PROVEN (S2)** | results/20260830_170305/d3d12_hip_interop.json, docs/INTEROP.md |
-| D3D12 shared buffers/textures | hipImportExternalMemory (D3D12Heap / D3D12Resource) | **PROVEN (S2)** | docs/INTEROP.md |
+| nvapi64.dll CUBIN APIs (CASE A) | nvapi_amd shim -> HIP/D3D12 dispatch | **seven-interface backend and boundary registry PASS standalone; Feature-18 injection and neural registry pending** | R-21/E-17, R-22/E-18, R-25..R-27 + NVIDIA R610 headers |
+| nvcuda.dll Driver API (CASE B/C) | ZLUDA nvcuda replacement (active project; known RDNA4+Windows issues, see RESEARCH.md) | **not selected for observed NR path** | R-18 has no private-path CUDA load |
+| GPU binary payload | function-isolated PTX -> ZLUDA/targeted lowering -> AMD code | **PARTIAL**: original clear executes; native copy lowering passes; neural instructions pending | R-24/R-26/R-27 |
+| D3D12 <-> compute sync | HIP external semaphore / fence interop | **PASS (S2 PASS-A)** | results/20260830_170305/d3d12_hip_interop.json, docs/INTEROP.md |
+| D3D12 shared buffers | hipImportExternalMemory (D3D12Heap / D3D12Resource) | **PASS (S2 PASS-A)** | docs/INTEROP.md |
+| D3D12 shared textures | hipImportExternalMemory buffer view | **PARTIAL (Phase G)**: roundtrip byte-exact for RGBA8/RGBA16F/R32F/RG16F, but memory layout is NOT identity (swizzled) — kernels need swizzle-aware addressing | results/*_texture_interop/texture_interop.json |
 | Weights transfer | plain host->device copies via HIP (format from binary_probe entropy analysis) | tooling ready | tools/binary_probe |
 | WMMA/MMA fast paths | plain FP16 GEMM first (S1 test D passes); WMMA blocked by S-B4 | partial | hip_probe.json, BLOCKERS.md |
 
 ## 4. PTX go/no-go gate (Phase 7 framework)
 
-Prerequisite: binary_probe manifest for nvngx_dlssnr.dll (currently MISSING_PREREQUISITE, B-1).
+Prerequisite satisfied: the user-supplied runtime has been mapped and all 15
+compressed PTX payloads have been extracted locally with metadata-only manifests.
 
 ```
 GATE-0  binary_probe finds fatbin container(s)?
@@ -112,28 +136,31 @@ GATE-4  kernel_lab numerical compare (build tools/kernel_lab):
                 Fixable -> iterate; unfixable -> Track B for that kernel.
 ```
 
-Track B (reconstruction, only if PTX path blocked): identify kernel math from
+Track B (per-function fallback when PTX translation is blocked): identify kernel math from
 weights shapes + I/O tensors + published architecture descriptions; re-implement
 as HIP kernels with numerical validation against the NVIDIA reference output
 (from results/*_reference_package run on an RTX machine). Explicitly: Track B is
 a REIMPLEMENTATION and must be labeled as such in every result — it is never
 presented as "executing the leaked kernels".
 
-Current gate status (2026-08-30, files now available):
-- GATE-0 **PASS** — 15 CUBIN ELF containers located in .rsrc (binary_manifest_dlssnr.json).
-- GATE-1 **FAIL** — zero PTX markers in nvngx_dlssnr.dll → **PTX path = BLOCKED**.
-  Per spec section 12: do NOT emulate SASS, do NOT claim ZLUDA can execute it.
-- Track B is the mandated path, with one material upgrade: because kernel NAMES and
-  per-kernel `.nv.info` parameter metadata survive intact, Track B's "recover the
-  compute graph" step starts from a named, structured kernel inventory (Swin-Transformer
-  backbone with fused pre/post blocks and FP8 variants) instead of black-box SASS.
-- The CASE A machinery (NVAPI CuModule/Cubin shim → HIP/HSACO dispatch) remains the
-  intended transport layer once the runtime's launch API set is confirmed post vendor gate.
+Current gate status (corrected 2026-08-31):
+- GATE-0 **PASS** — 15 `0xBA55ED50` runtime containers located in `.rsrc`.
+- GATE-1 **PASS** — all 15 contain Zstd-compressed PTX 9.4/sm_120; 231 entries.
+  The previous plaintext-marker FAIL was a compressed-data false negative.
+- GATE-2/3 **PARTIAL** — ZLUDA v7-preview.3 on RX 9070 XT compiles and executes
+  function-isolated `cc_cb_clear` with zero readback mismatches. It cannot parse
+  the copy kernel's surface store or the tested neural kernel's MMA/FP8 family.
+- GATE-4 is pending a neural operator and targeted RTX tensor oracle.
+- CASE A is confirmed by R-19..R-21. `nvapi_amd` implements the five-call
+  transport plus both descriptor-object calls; original PTX, targeted D3D12/HIP
+  lowering or a clean-room fallback supplies each real kernel implementation.
 
 ## 5. Trace artifacts (templates)
 
 - LoadLibrary/GetProcAddress trace: `results/<ts>/module_trace.log`
-  (inject build\module_trace.dll before NGX init)
+  (inject build\module_trace.dll before NGX init; Round 2 v2 exposes
+  ModuleTrace_InitializeAndWait so the host can wait for hooks_installed=true;
+  tests/module_trace_selftest gates readiness)
 - nvapi_QueryInterface decode: `results/<ts>/nvapi_trace.jsonl`
   (place build\nvapi64.dll where the target resolves nvapi64.dll; set NVAPI_TRACE_LOG)
 - CUDA Driver API calls (if any): covered by module_trace load events + a future
@@ -141,8 +168,12 @@ Current gate status (2026-08-30, files now available):
 - Run wrappers: `scripts\run_amd.ps1` (AMD side, shims on), `scripts\run_reference.ps1`
   (NVIDIA machine only — reference must be real)
 
-(Trace data: first load run captured module loads up to the vendor gate — see
-Section 2 first-dynamic-fact. Launch-side traces (nvapi IDs, CUDA driver calls)
-will be appended here after the vendor gate is passed; any gate-passage mechanism
-used purely to OBSERVE the call chain must be labeled trace-aid and never counted
-as execution evidence.)
+(Trace data: R-18 captures a naturally successful NVIDIA Feature-18 execution,
+not a vendor-spoof trace-aid. R-19's narrow QueryInterface wrapper identifies the
+complete official CASE-A lifecycle without replacing system NVAPI or touching
+Direct_GetMethod. The next tracer wraps only those typed official return pointers
+to record actual module/function/launch arguments. R-20 proves those calls and
+establishes the 156-launch frame length; the next capture uses that period to
+avoid v8's 60-call sampling alias. R-21 completes that capture: five identical
+156-slot graphs, 153 stable parameter blocks, three boundary-state variations,
+and exact mapping of nine runtime blobs to signed-DLL offsets.)

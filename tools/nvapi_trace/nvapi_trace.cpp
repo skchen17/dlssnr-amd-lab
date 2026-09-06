@@ -6,6 +6,10 @@
 // Binary payload pointers are never copied; only size-independent facts (magic
 // bytes behind a SEH-protected read) are recorded.
 //
+// Round 2 Phase F: the "stack args ride along" assumption is now validated by
+// tests/nvapi_trampoline_test (1..10 args, byte-exact). The trampoline builder
+// is exported as NvapiTrace_MakeTrampoline for that self-test.
+//
 // Log: JSONL at %NVAPI_TRACE_LOG% (default: .\nvapi_trace.jsonl).
 // Real dll search order: %NVAPI_REAL_DLL% -> <this dir>\nvapi64_real.dll
 //   -> <system32>\nvapi64.dll. If none exists the shim still records resolutions
@@ -22,12 +26,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 
 #include "nvapi_ids.h"
 
 typedef void* (*RealQueryInterface)(uint32_t);
-typedef uint64_t (*NvFn4)(uint64_t, uint64_t, uint64_t, uint64_t);
 
 struct StubCtx {
     uint32_t id;
@@ -78,8 +82,9 @@ static void LogInit() {
     g_logInitDone = true;
     InitializeCriticalSection(&g_cs);
     QueryPerformanceFrequency(&g_qpcFreq);
-    const char* logPath = getenv("NVAPI_TRACE_LOG");
-    if (!logPath || !*logPath) logPath = "nvapi_trace.jsonl";
+    char logPath[1024] = "nvapi_trace.jsonl";
+    DWORD n = GetEnvironmentVariableA("NVAPI_TRACE_LOG", logPath, sizeof(logPath));
+    if (n == 0 || n >= sizeof(logPath)) strcpy(logPath, "nvapi_trace.jsonl");
     g_log = _fsopen(logPath, "a", _SH_DENYNO);   // shared: readers may tail while we log
 }
 
@@ -143,38 +148,51 @@ static void PeekArg1(uint64_t a1, char* out, size_t n) {
     snprintf(out, n, "0x%08x", m);
 }
 
-// Central dispatcher: called by every trampoline. Forwards up to 4 register args;
-// additional stack args ride along untouched (pure jmp chain, no stack delta).
-extern "C" uint64_t NvapiTrampolineDispatch(StubCtx* ctx, uint64_t a1, uint64_t a2,
-                                            uint64_t a3, uint64_t a4) {
+// Central log point: called by the trampoline BEFORE it jumps to the real
+// function. Round 1 wrapped the call in a C dispatcher (NvFn4 cast, "stack
+// args ride along"); tests/nvapi_trampoline_test DISPROVED that for args 5+
+// (the dispatcher's frame sits between caller and callee, so stack args were
+// read from the wrong place). Round 2 fix: the trampoline only logs here,
+// then restores rcx/rdx/r8/r9 and does a pure `jmp` to the real function,
+// leaving the caller's stack arguments untouched. Consequence: return values
+// are no longer logged (byte-exact passthrough beats observability).
+// xmm/vector args are not preserved (nvapi surface is int/ptr; documented).
+extern "C" void NvapiTrace_LogEntry(StubCtx* ctx, uint64_t a1) {
     double t0 = NowMs();
     DWORD tid = GetCurrentThreadId();
     const char* src = nullptr;
     const char* name = NameFor(ctx->id, &src);
     char magic[32];
     PeekArg1(a1, magic, sizeof(magic));
-    Log("{\"ev\":\"call\",\"ts\":%.3f,\"tid\":%lu,\"id\":\"0x%08x\",\"name\":\"%s\",\"src\":\"%s\",\"arg1\":%llu,\"arg1_magic\":\"%s\"}",
-        t0, tid, ctx->id, name ? name : "", src, (unsigned long long)a1, magic);
-
-    uint64_t ret = 0;
-    if (ctx->realFn) {
-        ret = ((NvFn4)ctx->realFn)(a1, a2, a3, a4);
-    } else {
-        ret = 0xFFFFFFFF;   // NVAPI_GENERIC_ERROR-ish sentinel when no real dll
-    }
-    Log("{\"ev\":\"ret\",\"ts\":%.3f,\"tid\":%lu,\"id\":\"0x%08x\",\"ret\":%lld,\"ret_hex\":\"0x%llx\",\"dt_ms\":%.3f}",
-        NowMs(), tid, ctx->id, (long long)(int32_t)ret, (unsigned long long)ret, NowMs() - t0);
-    return ret;
+    Log("{\"ev\":\"call\",\"ts\":%.3f,\"tid\":%lu,\"id\":\"0x%08x\",\"name\":\"%s\",\"src\":\"%s\",\"arg1\":%llu,\"arg1_magic\":\"%s\",\"real\":%s}",
+        t0, tid, ctx->id, name ? name : "", src, (unsigned long long)a1, magic,
+        ctx->realFn ? "true" : "false");
 }
 
-// Thunk: stubs land here with rax=&StubCtx; preserves rcx..r9 and re-slots args.
-// All jumps use absolute indirection (rel32 cannot span VirtualAlloc<->image gap).
-//   mov r10, rcx         ; original arg1
-//   mov rcx, rax         ; ctx
-//   mov rdx, r10         ; arg1 -> param2
-//   mov r11, imm64       ; &NvapiTrampolineDispatch
-//   jmp r11
+// Thunk: stubs land here with rax=&StubCtx. Byte-exact passthrough for any
+// argument count (validated by tests/nvapi_trampoline_test, 1..10 args):
+//   sub rsp, 0x58               ; 0x28 home for the log call + 5 save slots
+//                               ; + 8 alignment (entry rsp == 8 mod 16)
+//   mov [rsp+0x28], rcx         ; stash arg1..arg4 + ctx below the stack args
+//   mov [rsp+0x30], rdx
+//   mov [rsp+0x38], r8
+//   mov [rsp+0x40], r9
+//   mov [rsp+0x48], rax
+//   mov rdx, rcx                ; LogEntry(ctx, a1)
+//   mov rcx, rax
+//   mov r11, imm64              ; &NvapiTrace_LogEntry (abs: alloc<->image gap)
+//   call r11
+//   mov rcx/rdx/r8/r9/rax back from the save slots
+//   mov r11, [rax+8]            ; StubCtx.realFn
+//   test r11,r11 / jnz
+//   mov rax, 0xFFFFFFFF         ; sentinel when no real dll, then ret
+//   add rsp, 0x58               ; rsp == entry rsp -> stack args untouched
+//   jmp r11                     ; real fn returns straight to the caller
 static unsigned char* g_thunk = nullptr;   // RWX copy built at first stub creation
+
+static void EmitBytes(unsigned char* t, size_t& n, std::initializer_list<unsigned char> b) {
+    for (auto x : b) t[n++] = x;
+}
 
 static void* MakeStub(StubCtx* ctx) {
     // stub: mov rax, imm64(ctx) ; mov r11, imm64(thunk) ; jmp r11
@@ -184,13 +202,31 @@ static void* MakeStub(StubCtx* ctx) {
         g_thunk = (unsigned char*)VirtualAlloc(nullptr, 4096, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         unsigned char* t = g_thunk;
         size_t n = 0;
-        t[n++] = 0x4C; t[n++] = 0x8B; t[n++] = 0xD1;   // mov r10, rcx
-        t[n++] = 0x48; t[n++] = 0x8B; t[n++] = 0xC8;   // mov rcx, rax
-        t[n++] = 0x49; t[n++] = 0x8B; t[n++] = 0xD2;   // mov rdx, r10
-        t[n++] = 0x49; t[n++] = 0xBB;                   // mov r11, imm64
-        void* disp = (void*)&NvapiTrampolineDispatch;
-        memcpy(t + n, &disp, 8); n += 8;
-        t[n++] = 0x41; t[n++] = 0xFF; t[n++] = 0xE3;   // jmp r11
+        EmitBytes(t, n, {0x48,0x81,0xEC,0x58,0x00,0x00,0x00});   // sub rsp, 0x58
+        EmitBytes(t, n, {0x48,0x89,0x4C,0x24,0x28});             // mov [rsp+0x28], rcx
+        EmitBytes(t, n, {0x48,0x89,0x54,0x24,0x30});             // mov [rsp+0x30], rdx
+        EmitBytes(t, n, {0x4C,0x89,0x44,0x24,0x38});             // mov [rsp+0x38], r8
+        EmitBytes(t, n, {0x4C,0x89,0x4C,0x24,0x40});             // mov [rsp+0x40], r9
+        EmitBytes(t, n, {0x48,0x89,0x44,0x24,0x48});             // mov [rsp+0x48], rax
+        EmitBytes(t, n, {0x48,0x8B,0xD1});                       // mov rdx, rcx
+        EmitBytes(t, n, {0x48,0x8B,0xC8});                       // mov rcx, rax
+        EmitBytes(t, n, {0x49,0xBB});                            // mov r11, imm64
+        void* logFn = (void*)&NvapiTrace_LogEntry;
+        memcpy(t + n, &logFn, 8); n += 8;
+        EmitBytes(t, n, {0x41,0xFF,0xD3});                       // call r11
+        EmitBytes(t, n, {0x48,0x8B,0x4C,0x24,0x28});             // mov rcx, [rsp+0x28]
+        EmitBytes(t, n, {0x48,0x8B,0x54,0x24,0x30});             // mov rdx, [rsp+0x30]
+        EmitBytes(t, n, {0x4C,0x8B,0x44,0x24,0x38});             // mov r8,  [rsp+0x38]
+        EmitBytes(t, n, {0x4C,0x8B,0x4C,0x24,0x40});             // mov r9,  [rsp+0x40]
+        EmitBytes(t, n, {0x48,0x8B,0x44,0x24,0x48});             // mov rax, [rsp+0x48]
+        EmitBytes(t, n, {0x4C,0x8B,0x58,0x08});                  // mov r11, [rax+8] (realFn)
+        EmitBytes(t, n, {0x4D,0x85,0xDB});                       // test r11, r11
+        EmitBytes(t, n, {0x75,0x0F});                            // jnz +15 (skip sentinel)
+        EmitBytes(t, n, {0x48,0xC7,0xC0,0xFF,0xFF,0xFF,0xFF});   // mov rax, 0xFFFFFFFF
+        EmitBytes(t, n, {0x48,0x81,0xC4,0x58,0x00,0x00,0x00});   // add rsp, 0x58
+        EmitBytes(t, n, {0xC3});                                 // ret
+        EmitBytes(t, n, {0x48,0x81,0xC4,0x58,0x00,0x00,0x00});   // add rsp, 0x58
+        EmitBytes(t, n, {0x41,0xFF,0xE3});                       // jmp r11
     }
     if (!pool || poolUsed + 48 > poolCap) {
         poolCap = 4096;
@@ -247,4 +283,21 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         LogInit();   // only log/timer setup here; backend init is lazy
     }
     return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 Phase F — ABI self-test hook.
+// Lets tests/nvapi_trampoline_test wrap an arbitrary function in the exact
+// same stub/thunk chain that nvapi_QueryInterface hands out, then verify all
+// arguments (1..10) + the return value arrive byte-exact.
+// ---------------------------------------------------------------------------
+extern "C" __declspec(dllexport) void* __cdecl NvapiTrace_MakeTrampoline(
+        uint32_t id, void* realFn) {
+    LogInit();
+    StubCtx* ctx = new StubCtx{ id, realFn, nullptr };
+    ctx->stub = MakeStub(ctx);
+    EnterCriticalSection(&g_cs);
+    g_stubs[id] = ctx;
+    LeaveCriticalSection(&g_cs);
+    return ctx->stub;
 }

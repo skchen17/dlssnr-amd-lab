@@ -1,0 +1,32 @@
+*.obj
+*.exp
+*.lib
+*.pdb
+*.res
+*.addon64
+*.log
+build/
+
+# NVIDIA NGX SDK (bring your own — see external/ngx/README.md); not redistributed here
+external/ngx/*.h
+external/ngx/*.lib
+external/ngx/libs/
+# Upstream bridge sources are not re-hosted; see README credits
+external/bridge-1.0.19/
+release/
+spike/*.exe
+spike/*.obj
+spike/*.log
+spike/*.err
+host/*.exe
+host/*.obj
+host/*.log
+host/*.err
+host/dxgi.dll
+host/*.addon64
+host/nvngx_*.dll
+host/reshade.ini
+host/ReShade.ini
+host/ReShadePreset.ini
+external/vulkan/vulkan/
+external/vulkan/vk_video/

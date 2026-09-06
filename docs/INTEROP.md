@@ -18,7 +18,7 @@ DLSSNR-on-AMD pipeline that needs D3D12 resources to feed HIP kernels.
 | T2 fence import | PASS | `ID3D12Fence` (`D3D12_FENCE_FLAG_SHARED`) → shared handle → `hipImportExternalSemaphore` with `hipExternalSemaphoreHandleTypeD3D12Fence` |
 | T3 D3D12 → HIP | PASS | D3D12 copies 1M×u32 pattern (base 0xA0000000) into shared buffer, signals fence(1); HIP waits on imported fence in-stream (`hipWaitExternalSemaphoresAsync`), verifies mismatch=0 |
 | T4 HIP → D3D12 | PASS | HIP kernel writes pattern (base 0xB0000000), `hipSignalExternalSemaphoresAsync` fence(2); D3D12 `ID3D12CommandQueue::Wait(fence,2)`, copies back, host verifies mismatch=0 |
-| T5 texture import | PASS (bonus) | shared RGBA8 64×64 texture imports via `D3D12Resource` and maps as a buffer view — useful for staging color buffers |
+| T5 texture import | PASS (bonus) | shared RGBA8 64×64 texture imports via `D3D12Resource` and maps as a buffer view — **Round 2 caveat (Phase G):** the buffer view is NOT identity-layout on AMD (swizzled); see below |
 | T6 PASS-B survey | NO API | no public HIP symbol embeds HIP kernels into a D3D12 command list (probed amdhip64.dll; absent in this process snapshot). PASS-B fallback = separate HIP queue + external fence, which T3/T4 prove works |
 
 Known anomalies (do not affect the verdict):
@@ -71,6 +71,21 @@ DLSSNR's actual API surface is known.
 
 ## Implication for later phases
 
-- Texture staging of NR inputs/outputs (color/depth/mv/exposure) is viable via T5.
+- Texture staging of NR inputs/outputs (color/depth/mv/exposure) is viable via T5,
+  with the Round 2 caveat below.
 - A ZLUDA-replaced CUDA path can rely on the same transport: whatever D3D12 resources the
   NR feature consumes can be mirrored to the HIP/ZLUDA side through shared handles.
+
+## Round 2 addendum — texture layout gate (tests/texture_interop_test)
+
+Phase G re-tested the texture path for RGBA8 / RGBA16F / R32F / RG16F with content
+verification in both directions:
+
+- HIP-modify → D3D12-readback roundtrip: **byte-exact (mismatch=0) for all four
+  formats** — the import/data path itself is sound.
+- D3D12-write → HIP linear read: **NOT identity** — AMD stores shared 2D texture
+  memory swizzled, so bytes are not at their linear offsets through the buffer view.
+
+Consequence: T5's "useful for staging color buffers" holds only for kernels that
+implement swizzle-aware addressing, or for pipelines that stage through plain buffers
+(which PASS-A covers). Recorded as BLOCKERS S-B7.

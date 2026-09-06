@@ -1,6 +1,7 @@
 # BINARY_ANALYSIS.md — nvngx_dlssnr.dll static analysis
 
-**State: ANALYZED (read-only) 2026-08-30.** Files legally supplied by the user
+**State: ANALYZED (read-only), corrected 2026-08-31 after runtime-container
+decompression.** Files legally supplied by the user
 (see docs/PROPRIETARY_FILES.md for ledger: version / SHA-256 / Authenticode).
 Binaries stay outside the repo; only metadata is recorded here.
 
@@ -11,9 +12,9 @@ Binaries stay outside the repo; only metadata is recorded here.
 | Size | 165,840,496 B | 58,977,904 B |
 | FileVersion | 310.8.0.0 | 310.7.0.0 |
 | Payload location | `.rsrc` raw size 147,696,792 B | `.data` |
-| CUDA modules | **15 CUBIN ELF payloads, all e_machine=190 (EM_CUDA)** | 670 ELF payloads |
+| CUDA modules | **15 hybrid runtime containers (`0xBA55ED50`), each carrying compressed PTX plus an sm_120 CUBIN/ELF representation** | 670 ELF payloads |
 | Target arch | **sm_120 (consumer Blackwell, RTX 50) — 15 markers, exactly 1 per module** | sm_89 (Ada, 163 markers) + sm_80 (6 markers) |
-| PTX present | **NO — zero `.target`/`.version`/`.visible .entry` markers in the whole file** | YES — `.target sm_89` ×16, `.version 8.7` ×8 |
+| PTX present | **YES — 15/15 Zstd payloads decode to PTX 9.4, target sm_120; 231 entries total** | YES — `.target sm_89` ×16, `.version 8.7` ×8 |
 | Static imports | VERSION, ADVAPI32, USER32, KERNEL32 only | same set |
 | nvcuda.dll import | **NO (static or delay)** | NO |
 | nvapi64.dll import | **NO (static or delay)** | NO |
@@ -32,6 +33,10 @@ Binaries stay outside the repo; only metadata is recorded here.
   (FP8 e4m3/e5m2) instruction dependency is structural, not incidental.
 - Extracted copies (metadata work, never committed): results/20260830_170305/
   carved_cubin_{0,1}.elf + .readobj.log; carve script: scripts/_carve_cubin.ps1.
+- The original whole-file ASCII scan missed PTX because it is Zstd-compressed
+  inside the `0xBA55ED50` runtime containers. `scripts/extract_runtime_modules.py`
+  locates the Zstd frame, decompresses it without changing the proprietary input,
+  and records a metadata-only manifest. All 15 containers decode successfully.
 
 ## Checklist (the 18 questions from the experiment spec) — ANSWERED
 
@@ -41,13 +46,13 @@ Binaries stay outside the repo; only metadata is recorded here.
 | 2 | Direct nvcuda.dll import? | **NO** | binary_manifest_dlssnr.json |
 | 3 | Loads nvapi64.dll? | Not statically imported; during our run no nvapi64 load occurred before the vendor-gate failure. Post-gate behavior still to be traced. | forcload_*_module_trace.log |
 | 4 | nvapi_QueryInterface dispatch? | Not observed yet — init dies at vendor gate (0xbad00001) before any nvapi call. Trace pending gate passage. | nr_host_forceload_stdout.log |
-| 5 | .nv_fatbin / CUDA payload? | No fatbin container magic; payload = 15 raw CUBIN ELFs inside .rsrc | probe manifest markers |
+| 5 | .nv_fatbin / CUDA payload? | 15 NVIDIA runtime containers (`0xBA55ED50`) in `.rsrc`; each has compressed PTX and an sm_120 CUBIN/ELF representation | extraction manifest + ELF markers |
 | 6 | GPU module count | **15** (NR); 670 in the SR runtime | binary_manifest_*.json |
 | 7 | Target SM | **sm_120 only** (15 markers = 15 modules) | sm_targets_scan.log |
-| 8 | fatbin / PTX / CUBIN / mixed | **Pure CUBIN (SASS)** for NR; SR runtime is CUBIN+PTX mixed | binary_probe scans |
-| 9 | PTX fallback? | **NO** — zero PTX markers in the NR DLL | binary_probe PTX scan |
-| 10 | PTX version | n/a for NR (absent); SR runtime ships PTX 8.7 | probe logs |
-| 11 | Blackwell-only SASS? | **YES** — sm_120 exclusively, no sm_89/sm_90 fallback | sm_targets_scan.log |
+| 8 | fatbin / PTX / CUBIN / mixed | **Mixed compressed PTX + CUBIN** for NR | extraction manifest + ELF scans |
+| 9 | PTX fallback? | **YES as a representation** — PTX is present in all 15 containers; translator compatibility is instruction-dependent | extraction manifest + ZLUDA probes |
+| 10 | PTX version | **9.4**, target sm_120; SR runtime separately ships PTX 8.7 | extraction manifests |
+| 11 | Blackwell-only SASS? | CUBIN is sm_120-only, but it is no longer the only available representation because PTX 9.4 is present | sm_targets_scan.log + extraction manifest |
 | 12 | Ada patch payload class | Consistent with community evidence: RTX-40 patch = CUDA binary (CUBIN) swap | RESEARCH.md + this analysis |
 | 13 | Tensor Core / FP8 dependency | **YES** — explicit `_fp8` kernel variants throughout | carved_cubin_0.readobj.log |
 | 14 | Kernel names preserved? | **YES, fully** (see list above) | carved_cubin_*.readobj.log |
@@ -56,23 +61,30 @@ Binaries stay outside the repo; only metadata is recorded here.
 | 17 | Weights vs code separation | Separable: code = 15 ELFs; weights/constants = entropy regions (exact split pending dynamic trace) | probe manifest |
 | 18 | Compression / encryption | PE + ELF parse cleanly (no code-layer encryption); entropy runs look like dense/compressed weight data, not a wrapper | probe entropy report |
 
-## Go/no-go consequence (Phase 7 GATE-0/1 verdict)
+## Go/no-go consequence (corrected GATE verdict)
 
-- GATE-0 PASS: payload containers located (15 CUBIN ELFs in .rsrc).
-- GATE-1 **FAIL for the PTX route**: no PTX anywhere in nvngx_dlssnr.dll →
-  **PTX path = BLOCKED** per spec section 12. No ZLUDA JIT of NR kernels is possible.
-- However: the payload is a CUBIN *module set with preserved names and metadata*, and
-  the RTX-40 Ada patch demonstrates NVIDIA's own route is CUBIN-binary swap. The viable
-  replacement point is therefore the module-load/launch API surface (likely the NVAPI
-  CuModule/Cubin family — to be confirmed by trace after the vendor gate), substituting
-  HSACO for CUBIN, i.e. CASE A machinery + Track-B-style kernel provision.
+- GATE-0 PASS: 15 runtime containers located in `.rsrc`.
+- GATE-1 **PASS**: all 15 expose compressed PTX 9.4 / sm_120, totaling 231
+  entries. The previous FAIL was a false negative caused by scanning compressed
+  data for plaintext markers.
+- GATE-2 is **PARTIAL** on RX 9070 XT with ZLUDA v7-preview.3. Function-isolated
+  `cc_cb_clear` compiles and executes byte-exactly (27,648 words changed to
+  `0xffffffff`, zero mismatches). `cg2r_copy_kernel` is rejected at
+  `sust.p.2d.v4.b32.zero`; the first neural entry is rejected at PTX constructs
+  including tuple-discard `mov`, `mma.sync`, and FP8 conversions.
+- The viable implementation route is now hybrid: reuse function-isolated PTX
+  where the translator accepts it; lower unsupported texture/tensor instructions
+  to HIP/LLVM equivalents; retain clean-room HIP reconstruction as the fallback
+  per function rather than the default for all 43 used kernels.
 
 ## Methodology requirements (met)
 
 - Read-only on the original files; all analysis reproducible via scripts/_probe_now.ps1,
   _carve_cubin.ps1, _readobj_cubin.ps1, _scan_sm_targets.ps1.
-- CUDA-binary-aware tooling used: PE parser + ELF payload enumeration + llvm-objdump on
-  carved CUBINs — NOT just ASCII grep (the PTX-absence conclusion rests on binary_probe's
-  container/marker scan across all 165 MB plus ELF inspection of both large modules).
+- CUDA-binary-aware tooling used: PE parser, runtime-container/Zstd extraction,
+  ELF payload enumeration, llvm-objdump on carved CUBINs, and live function-level
+  `cuModuleLoadData`/`cuModuleGetFunction`/launch probes through ZLUDA.
 - Machine-readable manifests: results/20260830_170305/binary_manifest_{dlssnr,dlss}.json
-  (metadata only).
+  plus `results/20260831_010100_all_runtime_modules/extraction_manifest.json`
+  and `results/20260831_011219_zluda_ptx_probe/manifest.json` (metadata only;
+  extracted proprietary PTX remains ignored).

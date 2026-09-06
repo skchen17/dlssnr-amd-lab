@@ -30,18 +30,25 @@ static const NvApiIdName kNvApiKnownIds[] = {
     { 0x5F68DAAA, "NvAPI_D3D11_CreateDevice",             "nvapi.h" },
     { 0xBB939EE9, "NvAPI_D3D11_CreateDeviceAndSwapChain", "nvapi.h" },
     { 0x171C7F0A, "NvAPI_D3D11_IsNvShaderExtnOpCodeSupported", "nvapi.h" },
-    { 0x208B2ABF, "NvAPI_D3D12_IsFatbinPTXSupported",     "nvapi.h" },  // name per nvapi.h ext
-    { 0x2A2C79E8, "NvAPI_D3D12_CreateGraphicsPipelineState", "nvapi.h" },
+    { 0x70C07832, "NvAPI_D3D12_IsFatbinPTXSupported",     "nvapi.h" },
+    { 0x299F5FDC, "NvAPI_D3D12_CreateCubinComputeShaderExV2", "nvapi.h" },
+    { 0x2A2C79E8, "NvAPI_D3D12_CreateCubinComputeShader", "nvapi.h" },
+    { 0x3151211B, "NvAPI_D3D12_CreateCubinComputeShaderEx", "nvapi.h" },
+    { 0x1DC7261F, "NvAPI_D3D12_CreateCubinComputeShaderWithName", "nvapi.h" },
+    { 0x5C52BB86, "NvAPI_D3D12_LaunchCubinShader",        "nvapi.h" },
+    { 0x7FB785BA, "NvAPI_D3D12_DestroyCubinComputeShader", "nvapi.h" },
+    { 0xAD1A677D, "NvAPI_D3D12_CreateCuModule",           "nvapi.h" },
+    { 0x7AB88D88, "NvAPI_D3D12_EnumFunctionsInModule",   "nvapi.h" },
+    { 0xE2436E22, "NvAPI_D3D12_CreateCuFunction",         "nvapi.h" },
+    { 0x24973538, "NvAPI_D3D12_LaunchCuKernelChain",      "nvapi.h" },
+    { 0x846A9BF0, "NvAPI_D3D12_LaunchCuKernelChainEx",    "nvapi.h" },
+    { 0x41C65285, "NvAPI_D3D12_DestroyCuModule",          "nvapi.h" },
+    { 0xDF295EA6, "NvAPI_D3D12_DestroyCuFunction",        "nvapi.h" },
 };
 
 // Community-cited IDs (fakenvapi / DLSS tooling). Treat as hypotheses:
 // the trace log records raw IDs regardless, so wrong names here cannot corrupt data.
 static const NvApiIdName kNvApiCommunityIds[] = {
-    { 0xC7449F65, "NvAPI_D3D12_EnumCuModules?(community)",         "community" },
-    { 0x162BD2E5, "NvAPI_D3D12_CreateCuModule?(community)",        "community" },
-    { 0xC79680B8, "NvAPI_D3D12_CreateCuFunction?(community)",      "community" },
-    { 0xD0D9F9C8, "NvAPI_D3D12_LaunchCuKernelChain?(community)",   "community" },
-    { 0x4C44B0AE, "NvAPI_D3D12_DestroyCuModule?(community)",       "community" },
     { 0x47552258, "NvAPI_D3D12_SetCreateGraphicsPipelineStateFlags?(community)", "community" },
 };
 

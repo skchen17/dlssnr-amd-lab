@@ -1,0 +1,2449 @@
+﻿// dlss5-feed - ReShade add-on
+//
+// Makes DLSS 5 neural rendering work in a D3D11 or D3D12 game that has no DLSS of its own.
+//
+// The DLSS 5 add-on (renodx-dlss5) only detours NVSDK_NGX_D3D12_CreateFeature /
+// EvaluateFeature and reads the DLSS "contract" it finds there (Color, Depth,
+// MotionVectors, Output, sizes, jitter, reset...). Nothing in a DLSS-less game ever
+// issues those calls, so this add-on issues them itself: it takes the frame ReShade is
+// processing (the backbuffer), the raw depth and the motion vectors prepared by the
+// companion effect "DLSS5_Feed.fx" (fed by any texMotionVectors provider),
+// copies the three into textures shared with a private D3D12 device, runs a genuine
+// DLSS DLAA evaluate on that device -- where the DLSS 5 add-on inserts its pass --
+// and copies the result back over the backbuffer, still inside ReShade's effect chain.
+//
+// The D3D11 <-> D3D12 transport (shared textures, shared fence, allocator ring) is
+// adapted from NIGos' dlss5-dx11-bridge (MIT), see external/bridge-1.0.19/LICENSE.
+// In a D3D12 game there is no transport at all: NGX runs on the game's own device
+// and queue (the DLSS 5 add-on's native scenario), with the motion vectors and
+// depth consumed zero-copy straight from the effect textures.
+// The NGX side uses NVIDIA's NGX SDK static library, which locates and loads the
+// driver's _nvngx.dll by itself.
+//
+// Behaviour is driven by dlss5-feed.cfg (re-read while the game runs). dlss5-feed.log
+// records what was found, what was built and the result of every NGX call.
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <d3dcompiler.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+
+#include <reshade.hpp>
+
+#include <nvsdk_ngx.h>
+#include <nvsdk_ngx_helpers.h>
+
+#include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
+
+#define FEED_VERSION "0.5.0"
+
+extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+    "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11 and "
+    "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
+    "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
+    "the frame. Needs DLSS5_Feed.fx and a texMotionVectors provider (e.g. ReshadeMotionEstimation). "
+    "Settings in dlss5-feed.cfg.";
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+static HMODULE          g_self;
+static char             g_log_path[MAX_PATH];
+static CRITICAL_SECTION g_log_cs;
+
+static void Log(const char *fmt, ...)
+{
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    static long written = 0;
+    static bool capped  = false;
+
+    EnterCriticalSection(&g_log_cs);
+    if (!capped)
+    {
+        FILE *f = nullptr;
+        if (fopen_s(&f, g_log_path, "a") == 0 && f != nullptr)
+        {
+            written += fprintf(f, "%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute, st.wSecond,
+                               st.wMilliseconds, line);
+            if (written > 8 * 1024 * 1024)
+            {
+                fprintf(f, "\n--- log capped at 8 MB ---\n");
+                capped = true;
+            }
+            fclose(f);
+        }
+    }
+    LeaveCriticalSection(&g_log_cs);
+}
+
+// Also raised in ReShade's log/overlay: reserved for things that stop the add-on working.
+static void Warn(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    Log("%s", line);
+    char tagged[1100];
+    _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 Feed] %s", line);
+    reshade::log::message(reshade::log::level::warning, tagged);
+}
+
+static const char *volatile g_where = "starting up";
+static void Breadcrumb(const char *what) { g_where = what; }
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
+{
+    const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+    wchar_t owner[MAX_PATH] = L"unknown";
+    HMODULE mod = nullptr;
+    if (addr != nullptr &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
+        GetModuleFileNameW(mod, owner, MAX_PATH);
+    Log("### CRASH RECORDED ###  exception 0x%08X at %p in %ls; this add-on was last doing: %s%s", code, addr,
+        owner, g_where, mod == g_self ? " (inside this add-on)" : "");
+    return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ---------------------------------------------------------------------------
+// Which DLSS 5 add-on build is installed? Its engine generation changes how we
+// should behave, so detect it instead of assuming:
+//  - classic builds hook the NGX vtable once and can miss the first create (the
+//    STANDBY latch our warm-up re-create medicates),
+//  - v45+ builds rescan every present and adopt missed features lazily from the
+//    evaluate, making the warm-up re-create pure waste (and a small crash surface),
+//    and add the EnableHooks policy key ('2' = NGX-only, correct for this feeder,
+//    since '1' patches Streamline modules at a self-described contested site).
+// The 'EnableHooks' string in the binary is the v45+ marker.
+// ---------------------------------------------------------------------------
+
+static char g_renodx_ver[48] = "not found";
+static bool g_renodx_lazy    = false;
+
+// Set when the game's device (or the process) is being destroyed: from that moment,
+// never call back into NGX. The DLSS 5 add-on tears its hooks down during device
+// destruction, and releasing a feature created through those hooks afterwards throws
+// on a foreign thread and wedges the quitting game (seen in DOOM: 0xE06D7363 in
+// KERNELBASE 18 ms after the add-on's vtable::Unhook). The OS reclaims it all anyway.
+static bool g_ngx_dying = false;
+
+static void DetectRenodxAddon()
+{
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "renodx-dlss5.addon64");
+
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
+        return;
+    }
+    const DWORD size = GetFileSize(f, nullptr);
+    DWORD got = 0;
+    char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
+        for (DWORD i = 0; i + 11 < size; ++i)
+            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+    free(buf);
+    CloseHandle(f);
+
+    DWORD dummy = 0;
+    const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
+    if (vsize > 0)
+    {
+        void *vdata = malloc(vsize);
+        VS_FIXEDFILEINFO *ffi = nullptr;
+        UINT flen = 0;
+        if (vdata != nullptr && GetFileVersionInfoA(path, 0, vsize, vdata) &&
+            VerQueryValueA(vdata, "\\", reinterpret_cast<void **>(&ffi), &flen) && ffi != nullptr)
+            sprintf_s(g_renodx_ver, "%u.%u.%u.%u", HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                      HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+        free(vdata);
+    }
+
+    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
+        g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
+                      : "classic (single hook pass; warm-up re-create stays on)");
+
+    if (g_renodx_lazy)
+    {
+        // Write EnableHooks=2 only when the user has not set it themselves.
+        char v[16];
+        size_t n = sizeof(v);
+        if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", v, &n))
+        {
+            reshade::set_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", "2");
+            Log("[feed] EnableHooks was unset; wrote EnableHooks=2 (NGX-only -- this feeder calls NGX directly, no Streamline)");
+        }
+        else
+            Log("[feed] EnableHooks=%s (user-set; leaving it alone)", v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
+// ---------------------------------------------------------------------------
+
+struct Cfg
+{
+    int   enabled;         // 0 = do nothing at all
+    int   mode;            // 0 inert, 1 transport only (copies the input back, no NGX), 2 full DLSS path
+    int   hdr;             // -1 auto (FP16/R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR
+    int   depth_inverted;  // -1 auto (RESHADE_DEPTH_INPUT_IS_REVERSED), 0 no, 1 yes
+    int   flags;           // -1 auto, else raw DLSS.Feature.Create.Flags
+    int   reset_every;     // 1 = NGX Reset flag every frame (diagnostic: no temporal history)
+    int   warmup_rebuild;  // frames after the first successful evaluate at which the feature is re-created once (0 = never)
+    int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
+    int   log_frames;      // how many first frames get a full parameter dump in the log
+    int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
+    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
+    float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
+    float mv_scale_y;
+};
+
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f };
+
+static void CfgPath(char *out)
+{
+    GetModuleFileNameA(g_self, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-feed.cfg");
+}
+
+static void CfgWriteDefault()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f,
+            "enabled=%d\n"
+            "mode=%d\n"
+            "hdr=%d\n"
+            "depth_inverted=%d\n"
+            "flags=%d\n"
+            "reset_every=%d\n"
+            "warmup_rebuild=%d\n"
+            "rebuild=%d\n"
+            "log_frames=%d\n"
+            "create_delay=%d\n"
+            "preset=%d\n"
+            "mv_scale_x=%.3f\n"
+            "mv_scale_y=%.3f\n",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    fclose(f);
+    Log("[feed] wrote default config to %s", path);
+}
+
+// Returns true when a creation-time value changed (the feature has to be rebuilt).
+static bool CfgReload()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
+
+    Cfg next = g_cfg;
+    char line[160];
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        char  key[64];
+        float val = 0.0f;
+        if (sscanf_s(line, "%63[^=]=%f", key, static_cast<unsigned>(sizeof(key)), &val) != 2) continue;
+        const int iv = static_cast<int>(val);
+        if      (_stricmp(key, "enabled")        == 0) next.enabled        = iv;
+        else if (_stricmp(key, "mode")           == 0) next.mode           = iv;
+        else if (_stricmp(key, "hdr")            == 0) next.hdr            = iv;
+        else if (_stricmp(key, "depth_inverted") == 0) next.depth_inverted = iv;
+        else if (_stricmp(key, "flags")          == 0) next.flags          = iv;
+        else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
+        else if (_stricmp(key, "warmup_rebuild") == 0) next.warmup_rebuild = iv;
+        else if (_stricmp(key, "rebuild")        == 0) next.rebuild        = iv;
+        else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
+        else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
+        else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
+        else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+    }
+    fclose(f);
+    if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
+
+    const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
+                         next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
+                         next.preset != g_cfg.preset;
+    const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
+    if (!changed) return false;
+    g_cfg = next;
+    Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
+        "rebuild=%d log_frames=%d create_delay=%d mv_scale=%.3f,%.3f",
+        g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+        g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    return rebuild;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
+static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
+
+static const char *kEffectFile     = "DLSS5_Feed.fx";
+static const char *kTechnique      = "DLSS5_Feed";
+// Known texMotionVectors providers -- a name check only, used for a helpful status
+// line. The shader consumes the community-standard texMotionVectors texture; any
+// effect that writes it works, listed here or not.
+static const struct { const char *file, *tech; } kMvProviders[] = {
+    { "MotionEstimation.fx",    "DRME" },
+    { "qUINT_motionvectors.fx", "MotionVectors" },
+};
+
+struct Feed
+{
+    // ReShade side
+    reshade::api::effect_runtime          *runtime;
+    reshade::api::effect_technique         technique;
+    reshade::api::effect_technique         launchpad;
+    reshade::api::effect_texture_variable  mv_var;
+    reshade::api::effect_texture_variable  depth_var;
+    bool                                   depth_reversed;
+    bool                                   handles_ok;
+    bool                                   missing_reported;
+
+    bool disabled;
+    bool session_ready;
+    bool frame_ready;
+    bool need_reset;
+    bool warmup_done;
+    int  consecutive_fails;
+    int  cfg_rebuild_seen;
+    int  create_grace;     // frames counted while holding the first feature create
+
+    // D3D12 side
+    ID3D12Device              *dev12;
+    ID3D12CommandQueue        *queue;
+    ID3D12GraphicsCommandList *list;
+    static const int           kFrames = 3;
+    ID3D12CommandAllocator    *alloc[kFrames];
+    UINT64                     alloc_fence[kFrames];
+    int                        frame_slot;
+    HANDLE                     fence_event;
+    ID3D12Fence               *fence12;
+    ID3D11Fence               *fence11;
+    ID3D11DeviceContext4      *ctx4;
+    UINT64                     fence_value;
+    ID3D11Device              *dev11;      // not owned
+    bool                       dev12_owned; // true on the D3D11/Vulkan paths (we created the private device)
+    reshade::api::command_queue *rs_queue;  // D3D12/Vulkan paths: ReShade's wrapper of the game's queue (not owned)
+
+    // Vulkan transport: the game-side halves of the shared resources, imported THROUGH
+    // ReShade's API (create_resource/create_fence with an existing NT handle), so ReShade
+    // performs the Vulkan external-memory import, tracks the images for barrier()/copy,
+    // and keeps every queue operation inside its own locks. No raw Vk* in this add-on.
+    reshade::api::device  *rs_dev;               // not owned
+    reshade::api::fence    rs_fence_in, rs_fence_out;  // wrap vk_sem_* for ReShade queue signal/wait
+    ID3D12Fence           *fence12_in, *fence12_out;  // the same fences, D3D12 side
+    HANDLE                 fence_in_handle, fence_out_handle;
+    HANDLE                 tex_shared_vk[SLOT_COUNT];
+    // raw-Vulkan imports of the D3D12 shared objects (ReShade's create_* import them
+    // as the wrong external type). Wrapped back into rs_fence_* for ReShade queue ops.
+    FeedVk                 vk;
+    VkImage                vk_img[SLOT_COUNT];
+    VkDeviceMemory         vk_mem[SLOT_COUNT];
+    VkSemaphore            vk_sem_in, vk_sem_out;
+    bool                   vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+    UINT64                 vk_frame;
+
+    // NGX
+    bool                 ngx_inited;
+    NVSDK_NGX_Parameter *params;
+    NVSDK_NGX_Handle    *feature;
+
+    // shared textures
+    ID3D12Resource  *tex12[SLOT_COUNT];
+    ID3D11Texture2D *tex11[SLOT_COUNT];
+    HANDLE           shared[SLOT_COUNT];
+    ID3D11ShaderResourceView *output_srv;   // on tex11[SLOT_OUTPUT], for the copy-back blit
+    UINT        width, height;
+    DXGI_FORMAT color_fmt, output_fmt;      // shared texture formats
+    DXGI_FORMAT bb_fmt;                     // the backbuffer's format, to notice swaps
+    bool        hdr;
+    int         create_flags;
+
+    // copy-back blit
+    ID3D11VertexShader *blit_vs;
+    ID3D11PixelShader  *blit_ps;
+    ID3D11SamplerState *blit_sampler;
+
+    UINT64 frames_done;
+
+    LONGLONG qpf, cpu_ticks, span_start;
+    UINT64   timed_frames;
+};
+
+static Feed g;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+template <typename T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
+
+static const char *FormatName(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:    return "R16G16B16A16_FLOAT";
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
+    case DXGI_FORMAT_R11G11B10_FLOAT:       return "R11G11B10_FLOAT";
+    case DXGI_FORMAT_R10G10B10A2_UNORM:     return "R10G10B10A2_UNORM";
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return "R10G10B10A2_TYPELESS";
+    case DXGI_FORMAT_R8G8B8A8_UNORM:        return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   return "R8G8B8A8_UNORM_SRGB";
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return "R8G8B8A8_TYPELESS";
+    case DXGI_FORMAT_B8G8R8A8_UNORM:        return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   return "B8G8R8A8_UNORM_SRGB";
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return "B8G8R8A8_TYPELESS";
+    case DXGI_FORMAT_R16G16_FLOAT:          return "R16G16_FLOAT";
+    case DXGI_FORMAT_R32_FLOAT:             return "R32_FLOAT";
+    case DXGI_FORMAT_R32_TYPELESS:          return "R32_TYPELESS";
+    case DXGI_FORMAT_R24G8_TYPELESS:        return "R24G8_TYPELESS";
+    default:                                return "?";
+    }
+}
+
+// The shared Color copy must be typed (the DLSS 5 add-on samples it) and in the same
+// typeless family as the backbuffer so CopyResource can move the frame across.
+static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// DLSS writes its Output through a UAV; BGRA/X8 variants are not reliably UAV-typed, so
+// they get an RGBA8 output and the copy-back blit takes care of the channel order.
+static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
+{
+    switch (color_typed)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:    return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:                             return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static bool IsHdrFormat(DXGI_FORMAT typed)
+{
+    return typed == DXGI_FORMAT_R16G16B16A16_FLOAT || typed == DXGI_FORMAT_R11G11B10_FLOAT;
+}
+
+static const char *NgxResultName(NVSDK_NGX_Result r)
+{
+    switch (static_cast<unsigned>(r))
+    {
+    case 0x1:        return "Success";
+    case 0xBAD00001: return "FeatureNotSupported";
+    case 0xBAD00002: return "PlatformError";
+    case 0xBAD00003: return "FeatureAlreadyExists";
+    case 0xBAD00004: return "FeatureNotFound";
+    case 0xBAD00005: return "InvalidParameter";
+    case 0xBAD00006: return "ScratchBufferTooSmall";
+    case 0xBAD00007: return "NotInitialized";
+    case 0xBAD00008: return "UnsupportedInputFormat";
+    case 0xBAD00009: return "RWFlagMissing";
+    case 0xBAD0000A: return "MissingInput";
+    case 0xBAD0000B: return "UnableToInitializeFeature";
+    case 0xBAD0000C: return "OutOfDate";
+    case 0xBAD0000D: return "OutOfGPUMemory";
+    case 0xBAD0000E: return "UnsupportedFormat";
+    case 0xBAD0000F: return "UnableToWriteToAppDataPath";
+    case 0xBAD00010: return "UnsupportedParameter";
+    case 0xBAD00011: return "Denied";
+    case 0xBAD00012: return "NotImplemented";
+    default:         return "?";
+    }
+}
+
+static void FeedDisable(const char *why)
+{
+    if (g.disabled) return;
+    g.disabled = true;
+    Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
+}
+
+static void FeedFail(const char *what)
+{
+    Log("[feed] failure: %s", what);
+    if (++g.consecutive_fails >= 3)
+        FeedDisable("repeated failures");
+}
+
+// ---------------------------------------------------------------------------
+// D3D12 command submission (allocator ring + shared fence), from the bridge
+// ---------------------------------------------------------------------------
+
+static bool BeginCommands()
+{
+    const int slot = g.frame_slot;
+    const UINT64 retire = g.alloc_fence[slot];
+    if (retire != 0 && g.fence12->GetCompletedValue() < retire)
+    {
+        g.fence12->SetEventOnCompletion(retire, g.fence_event);
+        if (WaitForSingleObject(g.fence_event, 2000) != WAIT_OBJECT_0)
+        {
+            Log("[feed] the GPU did not retire allocator slot %d within 2 s", slot);
+            FeedDisable("the GPU stopped completing work");
+            return false;
+        }
+    }
+    if (g.alloc[slot] == nullptr) return false;
+    if (FAILED(g.alloc[slot]->Reset())) return false;
+    return SUCCEEDED(g.list->Reset(g.alloc[slot], nullptr));
+}
+
+static UINT64 EndCommands()
+{
+    g.list->Close();
+    ID3D12CommandList *lists[] = { g.list };
+    g.queue->ExecuteCommandLists(1, lists);
+    const UINT64 v = ++g.fence_value;
+    g.queue->Signal(g.fence12, v);
+    g.alloc_fence[g.frame_slot] = v;
+    g.frame_slot = (g.frame_slot + 1) % Feed::kFrames;
+    return v;
+}
+
+static void DrainGpu()
+{
+    if (g.queue == nullptr || g.fence12 == nullptr) return;
+    const UINT64 v = ++g.fence_value;
+    g.queue->Signal(g.fence12, v);
+    if (g.fence12->GetCompletedValue() < v && g.fence_event != nullptr)
+    {
+        g.fence12->SetEventOnCompletion(v, g.fence_event);
+        if (WaitForSingleObject(g.fence_event, 5000) != WAIT_OBJECT_0)
+            Log("[feed] timed out draining the queue before teardown");
+    }
+    for (int i = 0; i < Feed::kFrames; ++i) g.alloc_fence[i] = 0;
+}
+
+// NGX can access-violate inside its own code or inside the DLSS 5 add-on (a leaked, closed-source
+// snippet), especially across a resolution or device change. SEH keeps that from taking the game
+// down -- it becomes a graceful disable instead. These wrappers hold no C++ objects, so __try is
+// legal here under /EHsc (same approach as the dlss5-dx11-bridge).
+static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
+static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
+static void CloseListGuarded()
+{
+    __try { g.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// NGX crashed while recording into our list: it may hold half-written commands, and
+// executing those is what actually takes the game down (the driver faults later on
+// another thread). Close it guarded, throw it away WITHOUT executing, replace it.
+static void AbortCommands()
+{
+    if (g.list == nullptr) return;
+    CloseListGuarded();
+    SafeRelease(g.list);
+    if (g.alloc[g.frame_slot] != nullptr && g.dev12 != nullptr &&
+        SUCCEEDED(g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[g.frame_slot], nullptr,
+                                             __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list))))
+        g.list->Close();
+    else
+        Log("[feed] could not replace the aborted command list");
+}
+
+static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
+{
+    if (f == nullptr) return;
+    __try { NVSDK_NGX_D3D12_ReleaseFeature(f); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[feed] ReleaseFeature raised exception 0x%08X (ignored)", GetExceptionCode()); }
+}
+
+static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = res;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter  = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g.list->ResourceBarrier(1, &b);
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+static void ReleaseFrameResources()
+{
+    DrainGpu();
+    // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
+    // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
+    if (g.vk.ok)
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        {
+            if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
+            if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+        }
+    for (int i = 0; i < SLOT_COUNT; ++i)
+        if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
+    g.vk_layout_init = false;
+    SafeRelease(g.output_srv);
+    for (int i = 0; i < SLOT_COUNT; ++i)
+    {
+        SafeRelease(g.tex11[i]);
+        SafeRelease(g.tex12[i]);
+        if (g.shared[i] != nullptr) { CloseHandle(g.shared[i]); g.shared[i] = nullptr; }
+    }
+    if (g.feature != nullptr)
+    {
+        Breadcrumb("releasing the DLSS feature");
+        if (!g_ngx_dying) SafeReleaseFeature(g.feature);
+        g.feature = nullptr;
+    }
+    g.frame_ready = false;
+}
+
+// One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
+// way round if the driver refuses (WD2's driver only accepted the second route).
+static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource),
+                                                  reinterpret_cast<void **>(&g.tex12[i]));
+    if (SUCCEEDED(hr))
+        hr = g.dev12->CreateSharedHandle(g.tex12[i], nullptr, GENERIC_ALL, nullptr, &g.shared[i]);
+    if (SUCCEEDED(hr))
+        hr = dev1->OpenSharedResource1(g.shared[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex11[i]));
+    if (SUCCEEDED(hr))
+    {
+        Log("[feed] %-6s %ux%u %s via D3D12->D3D11", kSlotName[i], w, h, FormatName(fmt));
+        return true;
+    }
+    Log("[feed] %s: D3D12->D3D11 path failed 0x%08X, trying the other direction", kSlotName[i], hr);
+    SafeRelease(g.tex11[i]);
+    SafeRelease(g.tex12[i]);
+    if (g.shared[i] != nullptr) { CloseHandle(g.shared[i]); g.shared[i] = nullptr; }
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = w;
+    td.Height           = h;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+    hr = dev1->CreateTexture2D(&td, nullptr, &g.tex11[i]);
+    if (FAILED(hr)) { Log("[feed] %s: CreateTexture2D failed 0x%08X", kSlotName[i], hr); return false; }
+
+    IDXGIResource1 *dxgi_res = nullptr;
+    hr = g.tex11[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dxgi_res));
+    if (SUCCEEDED(hr))
+    {
+        hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+                                          &g.shared[i]);
+        dxgi_res->Release();
+    }
+    if (SUCCEEDED(hr))
+        hr = g.dev12->OpenSharedHandle(g.shared[i], __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.tex12[i]));
+    if (FAILED(hr)) { Log("[feed] %s: D3D11->D3D12 path failed 0x%08X", kSlotName[i], hr); return false; }
+
+    D3D12_RESOURCE_DESC got = g.tex12[i]->GetDesc();
+    Log("[feed] %-6s %ux%u %s via D3D11->D3D12 (d3d12 flags=0x%X%s)", kSlotName[i], w, h, FormatName(fmt), got.Flags,
+        (got.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? " UAV" : "");
+    if (i == SLOT_OUTPUT && !(got.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        Log("[feed]   *** Output has no UAV flag on the D3D12 side: DLSS cannot write it ***");
+    return true;
+}
+
+static bool MakeBlitShaders()
+{
+    if (g.blit_vs != nullptr && g.blit_ps != nullptr) return true;
+
+    static const char kSrc[] =
+        "Texture2D<float4> src : register(t0);\n"
+        "SamplerState smp : register(s0);\n"
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+        "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        "float4 ps(VSOut i) : SV_Target { return float4(src.Sample(smp, i.uv).rgb, 1.0); }\n";
+
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[feed] d3dcompiler_47.dll unavailable"); return false; }
+
+    ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err);
+    if (FAILED(hr)) { Log("[feed] blit VS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); return false; }
+    SafeRelease(err);
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err);
+    if (FAILED(hr)) { Log("[feed] blit PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); SafeRelease(vs); return false; }
+    SafeRelease(err);
+
+    hr = g.dev11->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.blit_vs);
+    if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.blit_ps);
+    vs->Release();
+    ps->Release();
+    if (FAILED(hr)) { Log("[feed] blit shader creation failed 0x%08X", hr); return false; }
+
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD   = D3D11_FLOAT32_MAX;
+    if (FAILED(g.dev11->CreateSamplerState(&sd, &g.blit_sampler))) { Log("[feed] blit sampler failed"); return false; }
+    Log("[feed] copy-back blit shaders ready");
+    return true;
+}
+
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
+
+// A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
+// the textures stay put, the new feature is created FIRST, and if that fails or crashes
+// the old feature keeps working -- a flaky re-create can no longer take the feed down.
+// (The DLSS 5 add-on has crashed twice inside a release-then-recreate; never again.)
+static bool RecreateFeatureOnly(UINT w, UINT h)
+{
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+    g.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+
+    NVSDK_NGX_Handle *old = g.feature;
+    g.feature = nullptr;
+    bool crashed = false;
+    if (CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        DrainGpu();  // the old feature's last evaluate may still be in flight
+        SafeReleaseFeature(old);
+        return true;
+    }
+    g.feature     = old;   // keep what worked
+    g.warmup_done = true;  // and stop asking
+    g.frame_ready = true;
+    Log("[feed] feature re-create %s; keeping the previous feature", crashed ? "crashed (caught)" : "failed");
+    return true;
+}
+
+static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
+    Breadcrumb("building shared textures");
+    ReleaseFrameResources();
+
+    ID3D11Device1 *dev1 = nullptr;
+    if (FAILED(g.dev11->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
+    { Log("[feed] ID3D11Device1 unavailable"); return false; }
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        dev1->Release();
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    bool ok = MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,           false) &&
+              MakeSharedPair(dev1, SLOT_OUTPUT, w, h, g.output_fmt,          true)  &&
+              MakeSharedPair(dev1, SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT, false) &&
+              MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false);
+    dev1->Release();
+    if (!ok) { ReleaseFrameResources(); return false; }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format              = g.output_fmt;
+    sv.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    if (FAILED(g.dev11->CreateShaderResourceView(g.tex11[SLOT_OUTPUT], &sv, &g.output_srv)))
+    { Log("[feed] output SRV creation failed"); ReleaseFrameResources(); return false; }
+
+    if (!MakeBlitShaders()) { ReleaseFrameResources(); return false; }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
+}
+
+// The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
+// size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
+{
+    if (crashed != nullptr) *crashed = false;
+    int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    if (inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    if (g.hdr)    flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    if (g_cfg.flags >= 0) flags = g_cfg.flags;
+    g.create_flags = flags;
+
+    NVSDK_NGX_DLSS_Create_Params cp = {};
+    cp.Feature.InWidth            = w;
+    cp.Feature.InHeight           = h;
+    cp.Feature.InTargetWidth      = w;
+    cp.Feature.InTargetHeight     = h;
+    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.InFeatureCreateFlags       = flags;
+    cp.InEnableOutputSubrects     = false;
+
+    // Render-preset hint: presets differ in how aggressively history is clamped, which is
+    // both a diagnostic and a partial mitigation for warping around transparents (dust,
+    // flames) whose optical-flow vectors drag the background along. K=11 transformer is
+    // the modern default; E=5/F=6 are the legacy CNN presets with stronger clamping.
+    if (g_cfg.preset > 0)
+    {
+        g.params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
+        Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
+            g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
+    }
+
+    if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
+    Breadcrumb("creating the DLSS feature");
+    DWORD ccode = 0;
+    NVSDK_NGX_Result rf = SafeCreateDLSS(&cp, &ccode);
+    if (ccode != 0)
+    {
+        AbortCommands();  // half-recorded NGX work must never reach the GPU
+        Log("[feed] CreateFeature raised exception 0x%08X (caught; nothing was submitted)", ccode);
+        if (crashed != nullptr) *crashed = true;
+        return false;
+    }
+    const UINT64 v = EndCommands();
+    if (g.fence12->GetCompletedValue() < v)
+    {
+        g.fence12->SetEventOnCompletion(v, g.fence_event);
+        if (WaitForSingleObject(g.fence_event, 4000) != WAIT_OBJECT_0)
+        {
+            Log("[feed] feature creation did not complete within 4 s");
+            FeedDisable("creating the DLSS feature hung");
+            return false;
+        }
+    }
+    if (NVSDK_NGX_FAILED(rf) || g.feature == nullptr)
+    {
+        Log("[feed] CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf));
+        g.feature = nullptr;
+        return false;
+    }
+
+    Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+        w, h, flags,
+        (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
+        (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
+        (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
+        (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) ? "AutoExposure" : "",
+        FormatName(g.color_fmt), FormatName(g.output_fmt), inverted ? " (reversed)" : "");
+    g.need_reset  = true;
+    g.frame_ready = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Session: private D3D12 device + NGX
+// ---------------------------------------------------------------------------
+
+typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+
+static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
+{
+    Breadcrumb("opening the D3D12 session");
+    Log("################ feed: opening D3D12 session ################");
+    g_ngx_dying = false;
+    g.dev11 = dev11;
+
+    IDXGIDevice  *dxgi_dev = nullptr;
+    IDXGIAdapter *adapter  = nullptr;
+    if (SUCCEEDED(dev11->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_dev))) && dxgi_dev)
+    {
+        dxgi_dev->GetAdapter(&adapter);
+        dxgi_dev->Release();
+    }
+    if (adapter != nullptr)
+    {
+        DXGI_ADAPTER_DESC ad = {};
+        adapter->GetDesc(&ad);
+        Log("[feed] adapter: %ls  vram=%llu MB", ad.Description, (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+    }
+
+    // Loaded here, not imported: ReShade installs its D3D12 hooks when the library arrives,
+    // and those hooks are what let the DLSS 5 add-on see this device.
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    auto create_device = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    if (create_device == nullptr) { Log("[feed] no D3D12CreateDevice"); goto fail; }
+
+    {
+        HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+        if (FAILED(hr) || g.dev12 == nullptr) { Log("[feed] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        g.dev12_owned = true;
+
+        wchar_t data_path[MAX_PATH] = {};
+        GetModuleFileNameW(g_self, data_path, MAX_PATH);
+        if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+        Breadcrumb("initialising NGX on D3D12");
+        NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+        if (NVSDK_NGX_FAILED(r))
+        {
+            r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                    "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+            Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+        }
+        if (NVSDK_NGX_FAILED(r)) { Log("[feed] NGX would not initialise on this device/driver"); goto fail; }
+        g.ngx_inited = true;
+
+        NVSDK_NGX_Parameter *caps = nullptr;
+        r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+        if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+        {
+            int avail = 0, needs_driver = 0, maj = 0, min = 0;
+            caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+            caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+            caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &maj);
+            caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &min);
+            Log("[feed] NGX capabilities: SuperSampling.Available=%d NeedsUpdatedDriver=%d MinDriver=%d.%d", avail,
+                needs_driver, maj, min);
+            if (!avail) { Log("[feed] DLSS super sampling is not available on this GPU/driver"); goto fail; }
+        }
+        else
+            Log("[feed] capability query failed 0x%08X (%s); continuing", r, NgxResultName(r));
+
+        r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+        if (NVSDK_NGX_FAILED(r) || g.params == nullptr) { Log("[feed] AllocateParameters failed 0x%08X", r); goto fail; }
+
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        g.dev12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&g.queue));
+        for (int i = 0; i < Feed::kFrames; ++i)
+            g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                            reinterpret_cast<void **>(&g.alloc[i]));
+        if (g.alloc[0] != nullptr)
+            g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                       __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+        if (g.list != nullptr) g.list->Close();
+        g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+        HANDLE fh = nullptr;
+        hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+        if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12, nullptr, GENERIC_ALL, nullptr, &fh);
+        ID3D11Device5 *dev5 = nullptr;
+        if (SUCCEEDED(hr) && SUCCEEDED(dev11->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) && dev5)
+        {
+            hr = dev5->OpenSharedFence(fh, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g.fence11));
+            dev5->Release();
+        }
+        if (fh != nullptr) CloseHandle(fh);
+        if (FAILED(hr) || g.fence11 == nullptr) { Log("[feed] shared fence setup failed 0x%08X", hr); goto fail; }
+
+        if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))) || g.ctx4 == nullptr)
+        { Log("[feed] ID3D11DeviceContext4 unavailable"); goto fail; }
+
+        if (g.queue == nullptr || g.list == nullptr) { Log("[feed] D3D12 queue/list creation failed"); goto fail; }
+
+        Log("[feed] session ready: queue=%p list=%p fence12=%p fence11=%p", (void *)g.queue, (void *)g.list,
+            (void *)g.fence12, (void *)g.fence11);
+        Log("############# feed: session open #############");
+        if (adapter != nullptr) adapter->Release();
+        g.session_ready = true;
+        return true;
+    }
+
+fail:
+    if (adapter != nullptr) adapter->Release();
+    FeedDisable("the D3D12/NGX session failed to start");
+    return false;
+}
+
+static void ShutdownSession()
+{
+    ReleaseFrameResources();
+    if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
+    if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+    SafeRelease(g.blit_vs);
+    SafeRelease(g.blit_ps);
+    SafeRelease(g.blit_sampler);
+    SafeRelease(g.ctx4);
+    SafeRelease(g.fence11);
+    SafeRelease(g.fence12);
+    if (g.fence_event != nullptr) { CloseHandle(g.fence_event); g.fence_event = nullptr; }
+    SafeRelease(g.list);
+    for (int i = 0; i < Feed::kFrames; ++i) SafeRelease(g.alloc[i]);
+    SafeRelease(g.queue);
+    SafeRelease(g.dev12);
+    g.session_ready = false;
+    g.dev11 = nullptr;
+    g.rs_queue = nullptr;
+    if (g.vk.ok)
+    {
+        if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); g.vk_sem_in  = VK_NULL_HANDLE; }
+        if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); g.vk_sem_out = VK_NULL_HANDLE; }
+    }
+    g.rs_fence_in = {}; g.rs_fence_out = {};
+    SafeRelease(g.fence12_in);
+    SafeRelease(g.fence12_out);
+    if (g.fence_in_handle  != nullptr) { CloseHandle(g.fence_in_handle);  g.fence_in_handle  = nullptr; }
+    if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
+    g.rs_dev   = nullptr;
+    g.vk_frame = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Session, D3D12 same-device: NGX runs on the game's own device and queue -- the
+// DLSS 5 add-on's native scenario (it watches every D3D12 device ReShade knows).
+// No transport at all: MV and depth are consumed zero-copy from the effect
+// textures; only the backbuffer is copied (swapchain buffers are not reliably
+// shader-readable, and DLSS needs Output != Color anyway).
+// ---------------------------------------------------------------------------
+
+static bool InitSession12(reshade::api::effect_runtime *rt)
+{
+    Breadcrumb("opening the same-device D3D12 session");
+    Log("################ feed: opening same-device D3D12 session ################");
+    g_ngx_dying = false;
+
+    reshade::api::device *dev_api = rt->get_device();
+    auto *dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
+    g.rs_queue = rt->get_command_queue();
+    auto *queue = g.rs_queue != nullptr ? reinterpret_cast<ID3D12CommandQueue *>(g.rs_queue->get_native()) : nullptr;
+    if (dev == nullptr || queue == nullptr)
+    {
+        Log("[feed] no native D3D12 device/queue");
+        FeedDisable("the game's D3D12 device/queue is not reachable");
+        return false;
+    }
+
+    dev->AddRef();
+    g.dev12 = dev;
+    g.dev12_owned = false;
+    queue->AddRef();
+    g.queue = queue;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    Breadcrumb("initialising NGX on the game's device");
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+    if (NVSDK_NGX_FAILED(r))
+    {
+        ShutdownSession();
+        FeedDisable("NGX would not initialise on the game's device");
+        return false;
+    }
+    g.ngx_inited = true;
+
+    NVSDK_NGX_Parameter *caps = nullptr;
+    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+    {
+        int avail = 0;
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        if (!avail)
+        {
+            ShutdownSession();
+            FeedDisable("DLSS is not available on this GPU/driver");
+            return false;
+        }
+    }
+    else
+        Log("[feed] capability query failed 0x%08X (%s); continuing", r, NgxResultName(r));
+
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr)
+    {
+        Log("[feed] AllocateParameters failed 0x%08X", r);
+        ShutdownSession();
+        FeedDisable("NGX parameter allocation failed");
+        return false;
+    }
+
+    // Our own allocators + list on the game's device; submission goes to the game's queue.
+    for (int i = 0; i < Feed::kFrames; ++i)
+        g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        reinterpret_cast<void **>(&g.alloc[i]));
+    if (g.alloc[0] != nullptr)
+        g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                   __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+    if (g.list != nullptr) g.list->Close();
+    g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    if (g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
+    {
+        Log("[feed] D3D12 list/fence creation failed");
+        ShutdownSession();
+        FeedDisable("could not create the D3D12 objects");
+        return false;
+    }
+
+    Log("[feed] session ready (same-device): dev=%p queue=%p list=%p fence=%p", (void *)g.dev12, (void *)g.queue,
+        (void *)g.list, (void *)g.fence12);
+    Log("############# feed: session open (same-device D3D12) #############");
+    g.session_ready = true;
+    return true;
+}
+
+static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES initial)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    const HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, initial, nullptr,
+                                                        __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.tex12[i]));
+    if (FAILED(hr)) { Log("[feed] %s: CreateCommittedResource failed 0x%08X", kSlotName[i], hr); return false; }
+    Log("[feed] %-6s %ux%u %s on the game's device%s", kSlotName[i], w, h, FormatName(fmt), uav ? " (UAV)" : "");
+    return true;
+}
+
+static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
+    Breadcrumb("building same-device textures");
+    ReleaseFrameResources();
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.output_fmt = g.color_fmt;   // the copy home is a plain CopyResource; no blit on this path
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { g.output_fmt };
+    if (SUCCEEDED(g.dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+        (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
+        Log("[feed] note: %s reports no typed UAV store on this GPU; the DLSS output may fail", FormatName(g.output_fmt));
+
+    // Rest states: Color sits as a shader resource, Output as a UAV. Every transition away
+    // and back goes through ReShade's own barrier API so its state tracking stays right.
+    if (!MakeTex12(SLOT_COLOR, w, h, g.color_fmt, false,
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+        !MakeTex12(SLOT_OUTPUT, w, h, g.output_fmt, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Session, Vulkan transport: the game renders on Vulkan, but the DLSS 5 add-on
+// only hooks D3D12 -- so the evaluate runs on our private D3D12 device exactly as
+// on the D3D11 path, and the frame crosses the API boundary through shared NT
+// handles. The game-side halves are imported THROUGH ReShade's documented
+// shared-handle API; the create_fence/create_resource results below double as the
+// PLAN-VULKAN phase-0 probe (they fail cleanly if the device lacks the
+// external-memory/semaphore extensions, and the log says exactly which).
+// ---------------------------------------------------------------------------
+
+static bool InitSessionVk(reshade::api::effect_runtime *rt)
+{
+    Breadcrumb("opening the D3D12 session (Vulkan transport)");
+    Log("################ feed: opening D3D12 session (Vulkan transport) ################");
+    g_ngx_dying = false;
+
+    g.rs_dev   = rt->get_device();
+    g.rs_queue = rt->get_command_queue();
+    if (g.rs_dev == nullptr || g.rs_queue == nullptr)
+    {
+        FeedDisable("the ReShade device/queue is not reachable");
+        return false;
+    }
+
+    // Private D3D12 device, loaded so ReShade hooks it -- that hook is what lets the
+    // DLSS 5 add-on see the device (proven on the D3D11 path since Metro; whether it
+    // also holds when ReShade is loaded as a Vulkan layer is part of this probe:
+    // look for the add-on's "hooks installed" line in ReShade.log).
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    auto create_device = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    if (create_device == nullptr)
+    {
+        Log("[feed] no D3D12CreateDevice");
+        FeedDisable("d3d12.dll unavailable");
+        return false;
+    }
+    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+    if (FAILED(hr) || g.dev12 == nullptr)
+    {
+        Log("[feed] D3D12CreateDevice failed 0x%08X", hr);
+        FeedDisable("the private D3D12 device failed");
+        return false;
+    }
+    g.dev12_owned = true;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    Breadcrumb("initialising NGX (Vulkan transport)");
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+    if (NVSDK_NGX_FAILED(r))
+    {
+        ShutdownSession();
+        FeedDisable("NGX would not initialise");
+        return false;
+    }
+    g.ngx_inited = true;
+
+    NVSDK_NGX_Parameter *caps = nullptr;
+    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+    {
+        int avail = 0;
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        if (!avail)
+        {
+            ShutdownSession();
+            FeedDisable("DLSS is not available on this GPU/driver");
+            return false;
+        }
+    }
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr)
+    {
+        Log("[feed] AllocateParameters failed 0x%08X", r);
+        ShutdownSession();
+        FeedDisable("NGX parameter allocation failed");
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    g.dev12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&g.queue));
+    for (int i = 0; i < Feed::kFrames; ++i)
+        g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        reinterpret_cast<void **>(&g.alloc[i]));
+    if (g.alloc[0] != nullptr)
+        g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                   __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+    if (g.list != nullptr) g.list->Close();
+    g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    if (g.queue == nullptr || g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
+    {
+        Log("[feed] D3D12 queue/list/fence creation failed");
+        ShutdownSession();
+        FeedDisable("could not create the D3D12 objects");
+        return false;
+    }
+
+    // The two cross-API fences: created shared on D3D12, imported into the game's
+    // device through ReShade. A D3D12 fence and a Vulkan timeline semaphore are the
+    // same kernel object by design, so the frame counter crosses unchanged.
+    hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_in));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_in, nullptr, GENERIC_ALL, nullptr, &g.fence_in_handle);
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_out));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_out, nullptr, GENERIC_ALL, nullptr, &g.fence_out_handle);
+    if (FAILED(hr))
+    {
+        Log("[feed] shared fence creation failed 0x%08X", hr);
+        ShutdownSession();
+        FeedDisable("shared fence creation failed");
+        return false;
+    }
+
+    // Import both D3D12 fences into the game's Vulkan device as timeline semaphores,
+    // ourselves (ReShade's create_fence imports as the wrong external type). Then wrap
+    // the VkSemaphores back into api::fence handles -- in ReShade's Vulkan backend an
+    // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
+    if (!FeedVkLoad(&g.vk, reinterpret_cast<VkDevice>(g.rs_dev->get_native())))
+    {
+        Log("[feed] could not resolve the Vulkan external-memory/semaphore entry points");
+        ShutdownSession();
+        FeedDisable("Vulkan interop entry points unavailable (see dlss5-feed.log)");
+        return false;
+    }
+    g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+    g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+    Log("[feed] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+        g.vk_sem_in ? "OK" : "FAILED", g.vk_sem_out ? "OK" : "FAILED");
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
+        ShutdownSession();
+        FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
+        return false;
+    }
+    g.rs_fence_in  = { reinterpret_cast<uint64_t>(g.vk_sem_in) };
+    g.rs_fence_out = { reinterpret_cast<uint64_t>(g.vk_sem_out) };
+
+    Log("[feed] session ready (Vulkan transport): dev12=%p queue=%p", (void *)g.dev12, (void *)g.queue);
+    Log("############# feed: session open (Vulkan transport) #############");
+    g.session_ready = true;
+    return true;
+}
+
+static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
+                            reshade::api::resource_usage vk_usage, reshade::api::resource_usage vk_initial)
+{
+    // D3D12 half: shared committed resource, same shape MakeSharedPair creates.
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource),
+                                                  reinterpret_cast<void **>(&g.tex12[slot]));
+    if (SUCCEEDED(hr))
+        hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_vk[slot]);
+    if (FAILED(hr))
+    {
+        Log("[feed] %s: shared D3D12 texture failed 0x%08X", kSlotName[slot], hr);
+        return false;
+    }
+
+    // Game half: import the D3D12 memory into a VkImage ourselves (raw Vulkan; ReShade
+    // would import it as the wrong external type). Kept permanently in GENERAL layout.
+    (void)vk_usage; (void)vk_initial;
+    const VkFormat vkf = FeedVkFormat(fmt);
+    if (vkf == VK_FORMAT_UNDEFINED)
+    {
+        Log("[feed] %s: no VkFormat mapping for %s", kSlotName[slot], FormatName(fmt));
+        return false;
+    }
+    if (!FeedVkImportImage(&g.vk, g.tex_shared_vk[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
+    {
+        Log("[feed] texture import FAILED: %s %ux%u %s (raw Vulkan external-memory import)", kSlotName[slot], w, h, FormatName(fmt));
+        return false;
+    }
+    Log("[feed] %-6s %ux%u %s shared D3D12 -> imported as VkImage", kSlotName[slot], w, h, FormatName(fmt));
+    return true;
+}
+
+static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
+    Breadcrumb("building the Vulkan-shared textures");
+    ReleaseFrameResources();
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    // Rest states keep the shared images permanently copy-ready on the game side:
+    // inputs sit in copy_dest, the output in copy_source -- so the per-frame path
+    // never has to barrier them there at all.
+    const reshade::api::resource_usage copy_rw =
+        reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
+    if (!MakeSharedTexVk(SLOT_COLOR,  w, h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_OUTPUT, w, h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
+        !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Copy-back: shared Output -> the backbuffer ReShade handed us (any format, raw values)
+// ---------------------------------------------------------------------------
+
+static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
+{
+    // Save what we touch; ReShade rebinds its own state for every following pass anyway.
+    ID3D11RenderTargetView   *old_rtv = nullptr;
+    ID3D11DepthStencilView   *old_dsv = nullptr;
+    ID3D11VertexShader       *old_vs  = nullptr;
+    ID3D11PixelShader        *old_ps  = nullptr;
+    ID3D11ShaderResourceView *old_srv = nullptr;
+    ID3D11SamplerState       *old_smp = nullptr;
+    ID3D11InputLayout        *old_il  = nullptr;
+    ID3D11BlendState         *old_bs  = nullptr; FLOAT old_bf[4]; UINT old_mask = 0;
+    ID3D11DepthStencilState  *old_ds  = nullptr; UINT old_sref = 0;
+    ID3D11RasterizerState    *old_rs  = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY  old_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT nvp = 1; D3D11_VIEWPORT old_vp = {};
+    ctx->OMGetRenderTargets(1, &old_rtv, &old_dsv);
+    ctx->VSGetShader(&old_vs, nullptr, nullptr);
+    ctx->PSGetShader(&old_ps, nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 1, &old_srv);
+    ctx->PSGetSamplers(0, 1, &old_smp);
+    ctx->IAGetInputLayout(&old_il);
+    ctx->IAGetPrimitiveTopology(&old_topo);
+    ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ctx->OMGetDepthStencilState(&old_ds, &old_sref);
+    ctx->RSGetState(&old_rs);
+    ctx->RSGetViewports(&nvp, &old_vp);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width    = static_cast<float>(g.width);
+    vp.Height   = static_cast<float>(g.height);
+    vp.MaxDepth = 1.0f;
+    ID3D11RenderTargetView *rtvs[] = { rtv };
+    ID3D11ShaderResourceView *srvs[] = { g.output_srv };
+    ID3D11SamplerState *smps[] = { g.blit_sampler };
+    ctx->OMSetRenderTargets(1, rtvs, nullptr);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(nullptr);
+    ctx->RSSetViewports(1, &vp);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(g.blit_vs, nullptr, 0);
+    ctx->PSSetShader(g.blit_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, srvs);
+    ctx->PSSetSamplers(0, 1, smps);
+    ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView *no_srv = nullptr;
+    ctx->PSSetShaderResources(0, 1, &no_srv);
+    ctx->OMSetRenderTargets(1, &old_rtv, old_dsv);
+    ctx->VSSetShader(old_vs, nullptr, 0);
+    ctx->PSSetShader(old_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &old_srv);
+    ctx->PSSetSamplers(0, 1, &old_smp);
+    ctx->IASetInputLayout(old_il);
+    ctx->IASetPrimitiveTopology(old_topo);
+    ctx->OMSetBlendState(old_bs, old_bf, old_mask);
+    ctx->OMSetDepthStencilState(old_ds, old_sref);
+    ctx->RSSetState(old_rs);
+    if (nvp) ctx->RSSetViewports(1, &old_vp);
+    SafeRelease(old_rtv); SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps); SafeRelease(old_srv);
+    SafeRelease(old_smp); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+}
+
+// ---------------------------------------------------------------------------
+// Per frame
+// ---------------------------------------------------------------------------
+
+static void TimingTick(LONGLONG entry, LONGLONG exit)
+{
+    if (g.qpf == 0)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g.qpf = f.QuadPart;
+        g.span_start = entry;
+    }
+    g.cpu_ticks += (exit - entry);
+    if (++g.timed_frames < 600) return;
+    const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
+    const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
+    const double n       = double(g.timed_frames);
+    Log("[feed] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    g.cpu_ticks = 0;
+    g.timed_frames = 0;
+    g.span_start = exit;
+}
+
+static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
+{
+    if (res == nullptr) return nullptr;
+    ID3D11Texture2D *tex = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
+        return nullptr;
+    tex->GetDesc(desc);
+    return tex;  // caller releases
+}
+
+// ---------------------------------------------------------------------------
+// Per frame, D3D12 same-device: ReShade's own command list carries every barrier
+// and copy (so its state tracking stays right); our list carries only the NGX
+// evaluate, executed on the game's queue right after ReShade's work is flushed.
+// ---------------------------------------------------------------------------
+
+static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
+        return;
+    }
+
+    const resource bb_res = dev_api->get_resource_from_view(rtv);
+    auto *bb    = reinterpret_cast<ID3D12Resource *>(bb_res.handle);
+    auto *mv    = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+    if (bb == nullptr || mv == nullptr || depth == nullptr) return;
+
+    const D3D12_RESOURCE_DESC cd = bb->GetDesc(), md = mv->GetDesc(), dd = depth->GetDesc();
+    const UINT w = static_cast<UINT>(cd.Width), h = cd.Height;
+    if (cd.Width != md.Width || h != md.Height || cd.Width != dd.Width || h != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said12 = false;
+        if (!said12)
+        {
+            said12 = true;
+            Log("[feed] input mismatch: color %ux%u %s samp=%u | mv %ux%u %s | depth %ux%u %s -- skipping",
+                w, h, FormatName(cd.Format), cd.SampleDesc.Count, static_cast<UINT>(md.Width), md.Height,
+                FormatName(md.Format), static_cast<UINT>(dd.Width), dd.Height, FormatName(dd.Format));
+        }
+        return;
+    }
+
+    auto *native_dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
+    if (g.session_ready && !g.dev12_owned && g.dev12 != nullptr && g.dev12 != native_dev)
+    {
+        Log("[feed] the game recreated its D3D12 device; rebuilding the session");
+        ShutdownSession();
+    }
+    bool ok = g.session_ready || InitSession12(rt);
+
+    // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
+    // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
+    // and it re-patches after every runtime recreation.
+    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
+    if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+
+    if (ok && needs_build12)
+    {
+        Log("[feed] building: %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)", w, h,
+            FormatName(cd.Format), g.depth_reversed ? 1 : 0);
+        ok = BuildResources12(w, h, cd.Format);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok)
+    {
+        const resource color12  = { reinterpret_cast<uint64_t>(g.tex12[SLOT_COLOR]) };
+        const resource output12 = { reinterpret_cast<uint64_t>(g.tex12[SLOT_OUTPUT]) };
+
+        // ReShade renders effects into the backbuffer, so its tracked state here is render_target.
+        Breadcrumb("copying the backbuffer (D3D12)");
+        {
+            const resource       res[2]  = { bb_res, color12 };
+            const resource_usage from[2] = { resource_usage::render_target, resource_usage::shader_resource };
+            const resource_usage to[2]   = { resource_usage::copy_source, resource_usage::copy_dest };
+            cl->barrier(2, res, from, to);
+        }
+        cl->copy_resource(bb_res, color12);
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: the copied frame goes straight back.
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::copy_source };
+                cl->barrier(2, res, from, to);
+            }
+            cl->copy_resource(color12, bb_res);
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                const resource_usage to[2]   = { resource_usage::render_target, resource_usage::shader_resource };
+                cl->barrier(2, res, from, to);
+            }
+            ++g.frames_done;
+        }
+        else
+        {
+            // Park the backbuffer to receive the output; the copy becomes DLSS's colour input.
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::shader_resource };
+                cl->barrier(2, res, from, to);
+            }
+
+            // Everything recorded so far (the motion-vector provider, the feed passes, these copies) goes to
+            // the game's queue now; our evaluate follows it on the same queue.
+            Breadcrumb("flushing ReShade's command list");
+            g.rs_queue->flush_immediate_command_list();
+
+            bool restored = false;
+            if (!BeginCommands()) { FeedFail("command list"); }
+            else
+            {
+                const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+                g.need_reset = false;
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
+                ep.pInMotionVectors  = mv;
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the same-device evaluate");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                if (ecode != 0)
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                else
+                    EndCommands();
+
+                if (ecode != 0)
+                {
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
+                {
+                    Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                    FeedFail("evaluate");
+                    g.frame_ready = false;
+                }
+                else
+                {
+                    // The copy home is recorded on the (fresh) immediate list: it executes on
+                    // the same queue after the evaluate, so no fence is needed.
+                    {
+                        const resource       res[1]  = { output12 };
+                        const resource_usage from[1] = { resource_usage::unordered_access };
+                        const resource_usage to[1]   = { resource_usage::copy_source };
+                        cl->barrier(1, res, from, to);
+                    }
+                    cl->copy_resource(output12, bb_res);
+                    {
+                        const resource       res[2]  = { bb_res, output12 };
+                        const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                        const resource_usage to[2]   = { resource_usage::render_target, resource_usage::unordered_access };
+                        cl->barrier(2, res, from, to);
+                    }
+                    restored = true;
+
+                    const UINT64 n = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
+                        Log("[feed] frame %llu delivered (%ux%u, reset=%d, same-device)", n, g.width, g.height, reset);
+
+                    // The DLSS 5 add-on arms its NGX hooks a moment AFTER our first create (seen
+                    // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
+                    // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
+                    // keeps the old feature if the new create fails or crashes.
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, same-device)", n);
+                    }
+                }
+            }
+
+            if (!restored)
+            {
+                // Whatever went wrong, hand the backbuffer back in the state ReShade expects.
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
+// Per frame, Vulkan transport: ReShade's command list carries the copies between
+// the game's images and the shared ones, ReShade's queue signal/wait carries the
+// cross-API fences, and our private D3D12 list carries only the NGX evaluate.
+// ---------------------------------------------------------------------------
+
+static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a motion vector provider and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (bb_res.handle == 0 || mv_res.handle == 0 || depth_res.handle == 0) return;
+
+    const resource_desc cd = dev_api->get_resource_desc(bb_res);
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said_vk = false;
+        if (!said_vk)
+        {
+            said_vk = true;
+            Log("[feed] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u -- skipping",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format);
+        }
+        return;
+    }
+
+    bool ok = true;
+    if (g.session_ready && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed] the game recreated its device; rebuilding the session");
+        ShutdownSession();
+    }
+    if (!g.session_ready) ok = InitSessionVk(rt);
+
+    const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
+    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+    if (ok && needs_build_vk)
+    {
+        Log("[feed] building: %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)", w, h,
+            FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesVk(w, h, bbf);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok && g.frame_ready)
+    {
+        VkCommandBuffer cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
+        VkImage bb_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(bb_res.handle));
+        VkImage mv_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mv_res.handle));
+        VkImage dp_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(depth_res.handle));
+
+        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
+        // ReShade never touches them; only these raw barriers do.
+        Breadcrumb("copying inputs (Vulkan)");
+        {
+            const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+            g.vk_layout_init = true;
+        }
+        // Game images -> copy_source via ReShade (its layout tracking stays correct),
+        // then raw-copy each into our GENERAL image.
+        {
+            const resource       res[3]  = { bb_res, mv_res, depth_res };
+            const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource, resource_usage::shader_resource };
+            const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+            cl->barrier(3, res, from, to);
+        }
+        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+        FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: raw-copy the LEFT half of our COLOR back over the game's
+            // backbuffer -- a split screen is unambiguous proof of the round trip.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
+            }
+            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w / 2, h);
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+            ++g.frames_done;
+        }
+        else
+        {
+            // Park the backbuffer as copy_dest to receive the output; restore mv/depth.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
+            }
+
+            const UINT64 n = ++g.vk_frame;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            Breadcrumb("signalling the game-side fence (Vulkan)");
+            g.rs_queue->flush_immediate_command_list();
+            g.rs_queue->signal(g.rs_fence_in, n);
+
+            // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
+            g.queue->Wait(g.fence12_in, n);
+            bool done = false;
+            if (!BeginCommands()) FeedFail("command list");
+            else
+            {
+                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = g.tex12[SLOT_DEPTH];
+                ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                if (ecode != 0)
+                {
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else
+                {
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                    EndCommands();
+                    if (NVSDK_NGX_FAILED(re))
+                    {
+                        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                        FeedFail("evaluate");
+                        g.frame_ready = false;
+                    }
+                    else
+                        done = true;
+                }
+            }
+            if (done)
+                g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
+            else
+                g.fence12_out->Signal(n);            // CPU-signal so the game never hangs on us
+
+            // The copy home lands on the fresh immediate list, which executes on the
+            // game's queue after the wait below -- GPU-ordered, no CPU stall.
+            Breadcrumb("waiting for the result (Vulkan)");
+            g.rs_queue->wait(g.rs_fence_out, n);
+            cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
+                FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+
+            if (done)
+            {
+                const UINT64 fn = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+
+                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                {
+                    g.warmup_done = true;
+                    g.frame_ready = false;
+                    Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, Vulkan transport)", fn);
+                }
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
+// Per frame, D3D11: the original private-device transport
+// ---------------------------------------------------------------------------
+
+static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    reshade::api::device *dev_api = rt->get_device();
+
+    auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
+    if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    // Inputs from ReShade: the frame being processed, and the companion effect's two textures.
+    reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
+        return;
+    }
+
+    auto *color_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(rtv).handle);
+    auto *mv_res    = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+    auto *rtv11     = reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle);
+
+    D3D11_TEXTURE2D_DESC cd = {}, md = {}, dd = {};
+    ID3D11Texture2D *color = AsTexture2D(color_res, &cd);
+    ID3D11Texture2D *mv    = AsTexture2D(mv_res, &md);
+    ID3D11Texture2D *depth = AsTexture2D(depth_res, &dd);
+    if (color == nullptr || mv == nullptr || depth == nullptr)
+    {
+        SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+        return;
+    }
+
+    bool ok = true;
+    if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed] input mismatch: color %ux%u %s samp=%u | mv %ux%u %s | depth %ux%u %s -- skipping",
+                cd.Width, cd.Height, FormatName(cd.Format), cd.SampleDesc.Count, md.Width, md.Height,
+                FormatName(md.Format), dd.Width, dd.Height, FormatName(dd.Format));
+        }
+        ok = false;
+    }
+
+    if (ok)
+    {
+        ID3D11Device *dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev == nullptr) ok = false;
+        else
+        {
+            if (g.session_ready && g.dev11 != nullptr && dev != g.dev11)
+            {
+                Log("[feed] the game recreated its D3D11 device; rebuilding the session");
+                ShutdownSession();
+            }
+            if (!g.session_ready) ok = InitSession(dev, ctx);
+            dev->Release();
+        }
+    }
+
+    // The DLSS 5 add-on arms (and re-arms, on every runtime recreation) its NGX hooks
+    // asynchronously; calling into NGX while the vtable is being patched has crashed the
+    // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
+    // follows a runtime (re-)init until that settled.
+    const bool needs_build11 = !g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt;
+    if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+
+    if (ok && needs_build11)
+    {
+        Log("[feed] building: %ux%u backbuffer %s (mv %s, depth %s, depth reversed=%d)", cd.Width, cd.Height,
+            FormatName(cd.Format), FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0);
+        ok = BuildResources(cd.Width, cd.Height, cd.Format);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok)
+    {
+        Breadcrumb("copying inputs");
+        ctx->CopyResource(g.tex11[SLOT_COLOR], color);
+        ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
+        ctx->CopyResource(g.tex11[SLOT_MV], mv);
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: what went out comes straight back, through the same copy-back path.
+            ctx->CopyResource(g.tex11[SLOT_OUTPUT], g.tex11[SLOT_COLOR]);
+            BlitOutputToBackbuffer(ctx, rtv11);
+            ++g.frames_done;
+        }
+        else
+        {
+            const UINT64 v_in = ++g.fence_value;
+            g.ctx4->Signal(g.fence11, v_in);
+            ctx->Flush();
+            g.queue->Wait(g.fence12, v_in);
+
+            if (!BeginCommands()) { FeedFail("command list"); ok = false; }
+            else
+            {
+                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+                g.need_reset = false;
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = g.tex12[SLOT_DEPTH];
+                ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the D3D12 evaluate");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+
+                if (ecode != 0)
+                {
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else
+                {
+                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                const UINT64 v_out = EndCommands();
+
+                if (NVSDK_NGX_FAILED(re))
+                {
+                    Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                    FeedFail("evaluate");
+                    g.frame_ready = false;  // rebuild rather than repeat the same failure
+                    ok = false;
+                }
+                else
+                {
+                    Breadcrumb("waiting for the D3D12 result");
+                    g.ctx4->Wait(g.fence11, v_out);
+                    BlitOutputToBackbuffer(ctx, rtv11);
+                    const UINT64 n = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
+                        Log("[feed] frame %llu delivered (%ux%u, reset=%d)", n, g.width, g.height, reset);
+
+                    // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
+                    // recovers on a fresh one; re-create once after the pipeline has settled.
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                    }
+                }
+                }
+            }
+        }
+    }
+
+    SafeRelease(color);
+    SafeRelease(mv);
+    SafeRelease(depth);
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+    switch (rt->get_device()->get_api())
+    {
+    case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
+    case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
+    case reshade::api::device_api::vulkan: FeedFrameVk(rt, cl, rtv); break;
+    default: FeedDisable("only Direct3D 11/12 and Vulkan games are supported"); break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReShade events
+// ---------------------------------------------------------------------------
+
+static void ResolveHandles(reshade::api::effect_runtime *rt)
+{
+    g.technique = rt->find_technique(kEffectFile, kTechnique);
+    g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
+    g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
+    // Which known texMotionVectors provider is present? Purely informational.
+    g.launchpad = {};
+    const char *provider = "none";
+    for (const auto &p : kMvProviders)
+    {
+        const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
+        if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
+    }
+
+    char v[16] = {};
+    g.depth_reversed = true;  // ReShade.fxh's own default when the definition is absent
+    if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
+        g.depth_reversed = atoi(v) != 0;
+
+    g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
+    g.missing_reported = false;
+
+    // Games can recreate the swapchain (and ReShade its runtime) dozens of times per second;
+    // only say something when the situation actually changed.
+    const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
+                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) |
+                          ((g.launchpad.handle && rt->get_technique_state(g.launchpad)) ? 32 : 0);
+    static int last_signature = -1;
+    if (signature == last_signature) return;
+    last_signature = signature;
+
+    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, MV provider %s (%s), depth reversed=%d",
+        kEffectFile, g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
+        g.depth_var.handle ? "found" : "MISSING", provider,
+        g.launchpad.handle ? ((signature & 32) ? "enabled" : "DISABLED") : "-", g.depth_reversed ? 1 : 0);
+    if (!g.handles_ok)
+        Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
+    else if (g.launchpad.handle == 0)
+        Warn("no known texMotionVectors provider found (e.g. ReshadeMotionEstimation's DRME technique): motion vectors will be zero (still images only).");
+}
+
+static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
+{
+    g.runtime = rt;
+    ResolveHandles(rt);
+    // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
+    // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
+    // On the same-device D3D12 path its hooks live on the game's device and survive; the
+    // feature must NOT be touched (re-creating a live one is where the add-on crashes).
+    if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
+    // feature create for a fresh grace period.
+    g.create_grace = 0;
+    static int inits = 0;
+    if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
+    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
+}
+
+static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
+{
+    if (rt != g.runtime) return;
+    static int destroys = 0;
+    if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
+    // D3D11 path: the DLSS 5 add-on re-arms its hooks with the runtime, so the feature is
+    // rebuilt anyway. Same-device D3D12: feature and textures live on the GAME's device and
+    // survive runtime churn -- keep them. Every feature create near a hook re-arm has been
+    // a crash risk (EXEC 0x0 inside the add-on, sometimes fatal on a foreign thread), so
+    // the fewer creates, the better.
+    if (g.dev12_owned) ReleaseFrameResources();
+    g.runtime = nullptr;
+    g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
+    g.handles_ok = false;
+}
+
+static void OnReloadedEffects(reshade::api::effect_runtime *rt)
+{
+    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+}
+
+static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
+                              reshade::api::command_list *cl, reshade::api::resource_view rtv,
+                              reshade::api::resource_view /*rtv_srgb*/)
+{
+    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    FeedFrame(rt, cl, rtv);
+}
+
+static void OnDestroyDevice(reshade::api::device *dev)
+{
+    if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
+    {
+        Log("[feed] D3D11 device destroyed; shutting the session down");
+        g_ngx_dying = true;   // cleared again if a fresh session opens
+        ShutdownSession();
+    }
+    else if (g.session_ready && !g.dev12_owned && g.dev12 != nullptr &&
+             reinterpret_cast<ID3D12Device *>(dev->get_native()) == g.dev12)
+    {
+        Log("[feed] the game's D3D12 device is being destroyed; shutting the session down");
+        g_ngx_dying = true;
+        ShutdownSession();
+    }
+    else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
+    {
+        Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
+        g_ngx_dying = true;
+        ShutdownSession();
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        g_self = module;
+        DisableThreadLibraryCalls(module);
+        InitializeCriticalSection(&g_log_cs);
+        GetModuleFileNameA(module, g_log_path, MAX_PATH);
+        if (char *s = strrchr(g_log_path, '\\'))
+            strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed.log");
+        { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+
+        if (!reshade::register_addon(module)) return FALSE;
+
+        g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
+        Log("dlss5-feed %s (built %s %s) attached.", FEED_VERSION, __DATE__, __TIME__);
+        {
+            wchar_t exe[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            Log("  host: %ls", exe);
+        }
+        CfgWriteDefault();
+        CfgReload();
+        DetectRenodxAddon();
+
+        reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+        reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        g_ngx_dying = true;   // process is exiting: never call back into NGX
+        ShutdownSession();
+        reshade::unregister_addon(module);
+        Log("shut down cleanly.");
+    }
+    return TRUE;
+}

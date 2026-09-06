@@ -6,6 +6,9 @@
 *.fatbin
 *.ptx
 !third_party/**/*.dll
+# But NOT the prebuilt NVIDIA runtime DLLs shipped with the public DLSS repo
+# (~220 MB binaries; headers + provenance are enough to reproduce):
+third_party/nvidia-dlss/lib/**/*.dll
 # Whitelist patterns above are intentionally restrictive; review before force-adding anything.
 
 # Explicitly forbidden proprietary artifacts
@@ -16,12 +19,14 @@ libxess.dll
 *_addon*.dll
 game_files/
 proprietary/
+local_models/
 *.elf
 results/**/carved_*
 results/**/*reference_package*
 
 # ==== Build outputs ====
 build/
+.tools/
 out/
 cmake-build-*/
 *.obj
@@ -33,6 +38,8 @@ cmake-build-*/
 *.lib
 *.user
 .vs/
+__pycache__/
+*.pyc
 CMakeSettings.json
 CMakeUserPresets.json
 
@@ -45,4 +52,33 @@ results/**/*.mp4
 
 # ==== Environment ====
 .env
+.venv-rocm/
+datasets/
+checkpoints/
 *.local.cfg
+
+# Publication boundary: private weights, teacher/capture data and generated runs.
+# Historical reports remain local; never force-add runs to a publication snapshot.
+/results/
+/models/
+/deliverables/
+/build_*/
+*.zip
+*.7z
+*.weights
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.raw
+*.rgba16f
+*.addon64
+*.addon32
+.env.*
+*.pem
+*.key
+*.so
+*.so.*
+*.a
+/third_party/nvidia-dlss/lib/
+/third_party/nvidia-dlss/doc/
