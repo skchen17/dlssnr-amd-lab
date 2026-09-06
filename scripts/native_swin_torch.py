@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 import torch
 from torch import nn
+from native_fusion_policy import active_fusions
 
 
 def permute32(k):
@@ -26,6 +27,8 @@ def packed_b(tile, k, col):
 
 def quantize_e4(x):
     """Finite saturating E4M3 rounding; STE derivative for later micro-tuning."""
+    fusion=active_fusions()
+    if fusion is not None:return fusion.quantize(x)
     rounded = x.clamp(-448, 448).to(torch.float8_e4m3fn).to(x.dtype)
     return x + (rounded - x).detach() if x.requires_grad else rounded
 
@@ -149,10 +152,8 @@ class RecoveredSwin32(nn.Module):
             raise ValueError('expected [windows,2048] decoded FP16 packed features')
         a = quantize_e4(raw_windows[:, self.a_index])
         x = (a[:, None] @ self._weight('expand')).half()
-        clamped = x.clamp(-4, 4)
-        first = (-.055908203125 * clamped.abs().float() + .447265625).half()
-        second = (clamped.float() * first.float() + .89453125).half()
-        hidden = quantize_e4((x.float() * second.float()).half())
+        from native_grouped_ffn import quantized_cubic_silu
+        hidden = quantized_cubic_silu(x)
         first_output = (raw_windows[:, self.residual_index] * self.ffn_scale).half()
         for p in range(4):
             # Preserve per-32-channel accumulation boundaries, not per-instruction rounding.

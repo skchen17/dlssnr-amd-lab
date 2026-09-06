@@ -1,5 +1,12 @@
 # STATUS.md
 
+2026-09-06 DUAL NR ROUTES: opt-in exact HIP quantize/cubic fusion, 12-repeat
+4K host latency 2402.39 -> 1494.84 ms (-37.8%), unchanged output hashes.
+1080p/1440p NR plus actual FSR3.1 static component probes passed; NOT a resident
+game pipeline or temporal quality acceptance. Detailed fused stage timestamps
+failed the negative-gap gate; total GPU dispatch/busy time remain unmeasured.
+See [dual-route benchmark](DUAL_NR_ROUTES_BENCHMARK.md). Defaults unchanged.
+
 2026-09-06 NATIVE_OPT3: 4K FULL-FRAME OFFLINE 12 REPEATS PASS WITHIN SAMPLED 6 GB ENVELOPE.
 Opt-in window_batch768/query_chunk1024/key_chunk128/compact layout, frozen weights.
 3840x2160 synthetic gradient/checker (NOT game/teacher), padded3840x2176:

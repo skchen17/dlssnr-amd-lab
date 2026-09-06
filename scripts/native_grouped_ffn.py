@@ -39,6 +39,12 @@ def cubic_silu(x):
     return (x.float() * second.float()).half()
 
 
+def quantized_cubic_silu(x):
+    from native_fusion_policy import active_fusions
+    fusion=active_fusions()
+    return fusion.cubic(x) if fusion is not None else quantize_e4(cubic_silu(x))
+
+
 class RecoveredGroupedFFN(nn.Module):
     native_graph_complete = False
     rtx_quality_verified = False
@@ -87,7 +93,7 @@ class RecoveredGroupedFFN(nn.Module):
             for k in range(0, c, 32):
                 value = x[..., k:k+32].float() @ weight[k:k+32].float()
                 hidden = value.half() if hidden is None else (hidden.float() + value).half()
-        hidden = quantize_e4(cubic_silu(hidden)).reshape(-1, 64, self.heads, 4, 32)
+        hidden = quantized_cubic_silu(hidden).reshape(-1, 64, self.heads, 4, 32)
         hidden = hidden.permute(0, 2, 1, 3, 4)  # B,H,T,4,K32
         seed = (residual_features * self.residual_scale).half()
         contracted = seed[:, None] if c == 32 else None

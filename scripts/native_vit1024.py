@@ -9,7 +9,7 @@ import struct
 import torch
 from torch import nn
 from native_swin_torch import decode_e4, packed_b, quantize_e4
-from native_grouped_ffn import cubic_silu
+from native_grouped_ffn import cubic_silu,quantized_cubic_silu
 from native_split_swin512 import parameter, chunked_linear, channel_permutation
 from native_window_attention import normalize_qk
 from native_execution_policy import use_native_fp16, native_gemm
@@ -117,7 +117,7 @@ class RecoveredVit1024(nn.Module):
 
     def forward_ffn(self, x):
         self.require_input(x)
-        hidden = quantize_e4(cubic_silu(chunked_linear(x[..., self.perm1024], self.expand)))
+        hidden = quantized_cubic_silu(chunked_linear(x[..., self.perm1024], self.expand))
         return quantize_e4(chunked_linear(hidden[..., self.perm4096], self.contract, (x * self.ffn_scale).half()))
 
     def forward(self, x, *, query_chunk=32, key_chunk=128):
