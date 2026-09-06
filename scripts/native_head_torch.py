@@ -16,6 +16,7 @@ class RecoveredHead32(nn.Module):
         self._layout_cache={}
         self._layout_geometry=None
         self._layout_bytes=0
+        self._tail_cache=None
         self.block = RecoveredSwin32(packed_weights, record_kind='head32')
         halves = torch.frombuffer(bytearray(packed_weights), dtype=torch.float16)
         self.register_parameter('main_scale', nn.Parameter(halves[8272 // 2:8336 // 2].clone(), requires_grad=False))
@@ -52,6 +53,7 @@ class RecoveredHead32(nn.Module):
 
     def clear_layout_cache(self):
         self._layout_cache.clear();self._layout_geometry=None;self._layout_bytes=0
+        self._tail_cache=None
 
     def train(self,mode=True):
         self.clear_layout_cache()
@@ -84,6 +86,11 @@ class RecoveredHead32(nn.Module):
         total=((padded_width+11)//8)*((padded_height+11)//8)
         if type(start) is not int or type(count) is not int or start<0 or count<=0 or start+count>total:
             raise ValueError('invalid output-head CTA range')
+        from native_head_fusion import active_head_fusion
+        fusion=active_head_fusion()
+        if fusion is not None:
+            if self.training or torch.is_grad_enabled():raise ValueError('head fusion is inference only')
+            return self.project(fusion(main,skip,self.main_scale,self.skip_scale,start,count,padded_width,padded_height))
         if not self.cache_layout_enabled or self.training or torch.is_grad_enabled():
             return self(main,skip,torch.arange(start,start+count,device=main.device),padded_width,padded_height)
         if padded_width*padded_height*32>=2**31:
@@ -119,13 +126,32 @@ class RecoveredHead32(nn.Module):
         return self.project(fused)
 
     def project(self,fused):
-        projected = self.block(fused)
-        first = (projected[..., :16].float() @ self.tail[:16].float()).half()
-        return (first.float() + projected[..., 16:].float() @ self.tail[16:].float()).half()
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion()
+        from native_head_fusion import active_head_fusion
+        fusion=active_head_fusion()
+        if fusion is None:projected=self.block(fused)
+        else:
+            with fusion.block_scope():projected=self.block(fused)
+        if matrix is not None and 'head_output' in matrix.modules:
+            return matrix.head_tail(self,projected)
+        tail=self.tail
+        if self.block.inference_cache_enabled and not self.training and not torch.is_grad_enabled() and not tail.requires_grad:
+            identity=(tail.data_ptr(),tail._version,tail.device,tail.dtype)
+            if self._tail_cache is None or self._tail_cache[0] is not tail or self._tail_cache[1]!=identity:
+                self._tail_cache=(tail,identity,tail.float())
+            tail=self._tail_cache[2]
+        first = (projected[..., :16].float() @ tail[:16].float()).half()
+        product=projected[..., 16:].float() @ tail[16:].float()
+        if fusion is not None and fusion.enable_epilogue:return fusion.add(first,product)
+        return (first.float() + product).half()
 
 
 def compose_legacy_sdr_debug(residual, base, padded_width, padded_height):
     """Explicit OLD clamp/blend contract, never used as HDR implementation."""
+    from native_head_fusion import active_head_fusion
+    fusion=active_head_fusion()
+    if fusion is not None:return fusion.compose(residual,base,padded_width,padded_height)
     height, width, channels = base.shape
     gx, gy = (padded_width + 11) // 8, (padded_height + 11) // 8
     if width > padded_width or height > padded_height or channels != 4 or residual.shape != (gx * gy, 64, 4):

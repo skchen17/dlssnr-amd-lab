@@ -11,6 +11,11 @@ def gather_packed(packed, width, height, channels, ox, oy):
         raise ValueError('unrecovered feature geometry')
     if packed.numel() != width * height * channels:
         raise ValueError('incorrect packed feature size')
+    from native_c32_layout_fusion import active_c32_layout,Mapping
+    fusion=active_c32_layout()
+    if fusion is not None and channels==32:
+        mapping=Mapping(width,height,ox,oy)
+        return fusion.apply(packed,mapping),mapping
     gx, gy = (width - ox + 7) // 8, (height - oy + 7) // 8
     cta = torch.arange(gx * gy, device=packed.device)[:, None]
     cell = torch.arange(4, device=packed.device)[None, :]
@@ -38,6 +43,11 @@ def logical_indices(channels):
 
 def scatter_packed(values, mapping, width, height):
     channels = values.shape[-1]
+    from native_c32_layout_fusion import active_c32_layout,Mapping
+    if isinstance(mapping,Mapping):
+        fusion=active_c32_layout()
+        if fusion is None or channels!=32 or (width,height)!=(mapping.width,mapping.height):raise ValueError('C32 mapping scope mismatch')
+        return fusion.apply(values,mapping,scatter=True)
     index, valid = mapping
     physical = torch.arange(16 * channels, device=values.device)
     head, lane, element = physical // 512, physical % 512 // 16, physical % 16
@@ -64,4 +74,20 @@ class RecoveredPackedSwin(nn.Module):
     def forward(self, windows):
         if windows.ndim != 2 or windows.shape[1] != 64 * self.channels or windows.dtype != torch.float16:
             raise ValueError('incorrect packed window shape/dtype')
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion()
+        family=f'c{self.channels}_ffn'
+        if matrix is not None and self.channels in (64,128,256) and family in matrix.modules:
+            post=matrix.wide_ffn(self,windows)
+            attention_family=f'c{self.channels}_attention'
+            return matrix.wide_attention(self.block.attention,post) if attention_family in matrix.modules else self.block.attention(post)
+        attention_family=f'c{self.channels}_attention'
+        if matrix is not None and self.channels in (64,128) and attention_family in matrix.modules:
+            post=self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index])
+            return matrix.wide_attention(self.block.attention,post)
+        if matrix is not None and self.channels==32 and 'c32_ffn' in matrix.modules:
+            post=matrix.c32_ffn(self,windows)
+            return matrix.c32_attention(self.block.attention,post) if 'c32_attention' in matrix.modules else self.block.attention(post)
+        if matrix is not None and self.channels==32 and 'c32_attention' in matrix.modules:
+            return matrix.c32_attention(self.block.attention,self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index]))
         return self.block(windows[:, self.a_index], windows[:, self.residual_index])

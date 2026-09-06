@@ -49,6 +49,11 @@ def single_color_features(color,padded_width,padded_height,frame_seed,*,color_sc
     if len(conditioning)!=5:
         raise ValueError('explicit captured conditioning fields required')
     h,w,_=color.shape
+    from native_pre_fusion import active_pre_fusion
+    fusion=active_pre_fusion()
+    if fusion is not None:
+        noise=positional_noise(padded_width,padded_height,frame_seed,color.device)
+        return fusion(color,noise,padded_width,padded_height,color_scale,conditioning)
     ys=reflect_indices(h,padded_height,color.device)
     xs=reflect_indices(w,padded_width,color.device)
     rgb=color[ys[:,None],xs[None,:],:3]
@@ -73,6 +78,9 @@ def project_input_features(features,weight,*,rows_per_chunk=65536):
             or features.dtype!=torch.float16 or weight.dtype!=torch.float16
             or features.device!=weight.device or type(rows_per_chunk) is not int or rows_per_chunk<=0):
         raise ValueError('HWC16 FP16 features, same-device16x32 weight and positive row batch required')
+    from native_matrix_fusion import active_matrix_fusion
+    matrix=active_matrix_fusion()
+    if matrix is not None and 'pre_input' in matrix.modules:return matrix.pre_project(features,weight)
     flat=features.reshape(-1,16);matrix=weight.float()
     return torch.cat([(part.float()@matrix).half() for part in flat.split(rows_per_chunk)]).reshape(*features.shape[:2],32)
 

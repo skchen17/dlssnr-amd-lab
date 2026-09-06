@@ -112,8 +112,9 @@ class SingleColorWholeFrame(nn.Module):
         for b,value in self.decoder.stages(value,{c:skips[c] for c in (32,64,128,256)},pw//2,ph//2,window_batch=window_batch):
             yield b,value
         ctas=torch.arange(((pw+11)//8)*((ph+11)//8),device=color.device)
+        from native_head_fusion import active_head_fusion
         residual=torch.cat([self.head.forward_range(value,pre['skip'],start,min(boundary_batch,len(ctas)-start),pw,ph)
-                            for start in range(0,len(ctas),boundary_batch)]) if self.head.cache_layout_enabled else torch.cat(
+                            for start in range(0,len(ctas),boundary_batch)]) if self.head.cache_layout_enabled or active_head_fusion() is not None else torch.cat(
                                 [self.head(value,pre['skip'],batch,pw,ph) for batch in ctas.split(boundary_batch)])
         yield 70,compose_legacy_sdr_debug(residual,color,pw,ph)
 

@@ -24,7 +24,8 @@ def fixture(output,size):
         root=Path('results/20260906_opt3_fixture4k_v1')
         raw=(root/'input.rgba16f').read_bytes();info=json.loads((root/'manifest.json').read_bytes())
         if sha(raw)!=info['input_sha256']:raise ValueError('source fixture hash mismatch')
-        source_sha=sha(raw);w,h={'1080':(1920,1080),'1440':(2560,1440),'2160':(3840,2160)}[size]
+        source_sha=sha(raw);w,h={'1080':(1920,1080),'1440':(2560,1440),'2160':(3840,2160),
+                             '641':(641,361),'2342':(2342,1382),'3440':(3440,1440)}[size]
         if size!='2160':
             x=torch.frombuffer(bytearray(raw),dtype=torch.float16).reshape(2160,3840,4).permute(2,0,1)[None].float()
             raw=torch.nn.functional.interpolate(x,size=(h,w),mode='area')[0].permute(1,2,0).half().contiguous().numpy().tobytes()
@@ -42,6 +43,10 @@ def exercise(a,phase):
     from native_execution_policy import execution_policy
     from nr_operator_counter import OperatorCounter
     from native_fusion_policy import fusion_policy
+    from native_head_fusion import head_input_fusion
+    from native_pre_fusion import pre_features_fusion
+    from native_c32_layout_fusion import c32_layout_fusion
+    from native_matrix_fusion import matrix_fusion
     torch.set_num_threads(2)
     if not torch.version.hip or not torch.cuda.is_available():raise RuntimeError('ROCm required')
     props=torch.cuda.get_device_properties(0)
@@ -75,6 +80,7 @@ def exercise(a,phase):
     if sha(raw)!=meta['sha256']:raise ValueError('input changed')
     records,origins,settings=load_package('local_models/native_single_color_v1','AAE2A5425199829CFC95773405C94C5A943F8D9AF55423CF129E85792E2A2EE3')
     model=SingleColorWholeFrame(records,origins,**settings,max_padded_pixels=8847360).eval().cuda().requires_grad_(False)
+    model.head.block.inference_cache_enabled=a.head_weight_cache
     color=torch.frombuffer(bytearray(raw),dtype=torch.float16).reshape(h,w,4).cuda()
     if any(t.device.type!='cuda' for t in [color,*model.parameters(),*model.buffers()]):raise RuntimeError('CPU neural tensor')
     wait();phase('model_and_input_ready')
@@ -83,7 +89,7 @@ def exercise(a,phase):
         refmeta=json.loads((a.reference_output.parent/'input.json').read_bytes())
         if refmeta['sha256']!=meta['sha256'] or refmeta['geometry']!=meta['geometry']:raise ValueError('reference input differs')
         reference=sha(a.reference_output.read_bytes())
-    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused:
+    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv) as head_fused,pre_features_fusion(a.pre_features_dll) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix:
         for index in range(a.iterations):
             wait();torch.cuda.reset_peak_memory_stats()
             begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
@@ -105,12 +111,65 @@ def exercise(a,phase):
                   'peak_allocated_bytes':torch.cuda.max_memory_allocated(),'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
                   'device_used_bytes_sample':total-free,'output_sha256':reference}
             item['authored_fusions_cumulative']=fused.counts() if fused else None
+            item['head_input_launches_cumulative']=head_fused.launches if head_fused else 0
+            item['head_compose_launches_cumulative']=head_fused.compose_launches if head_fused else 0
+            item['head_gather_launches_cumulative']=head_fused.gather_launches if head_fused else 0
+            item['head_epilogue_launches_cumulative']=head_fused.add_launches if head_fused else 0
+            item['head_qkv_launches_cumulative']=head_fused.qkv_launches if head_fused else 0
+            item['matrix_launches_cumulative']=matrix.launches if matrix else 0
+            item['pre_features_launches_cumulative']=pre_fused.launches if pre_fused else 0
+            item['c32_layout_launches_cumulative']={'gather':c32_fused.gather_calls,'scatter':c32_fused.scatter_calls} if c32_fused else None
             if item['peak_reserved_bytes']>5000000000 or total-free>6000000000:raise RuntimeError('memory envelope exceeded')
             runs.append(item)
             with (a.output/'runs.jsonl').open('a') as f:f.write(json.dumps(item)+'\n')
             phase(f'frame{index}_validated')
             del value,finite,out,begin,end
         counter=OperatorCounter()
+        if a.drain_stages:
+            # Diagnostic only: per-stage draining changes overlap/scheduling.
+            # Never sum these measurements and label them normal forward time.
+            drained=[]
+            for repeat in range(3):
+                iterator=iter(model.stages(color,0,window_batch=768,query_chunk=1024))
+                for b in range(71):
+                    wait();torch.cuda.reset_peak_memory_stats()
+                    start=time.perf_counter();actual,value=next(iterator);wait()
+                    wall=(time.perf_counter()-start)*1000
+                    if actual!=b:raise RuntimeError('drained stage order mismatch')
+                    drained.append({'repeat':repeat,'block':b,'host_submit_wait_ms':wall,
+                        'peak_allocated_bytes':torch.cuda.max_memory_allocated(),
+                        'peak_reserved_bytes':torch.cuda.max_memory_reserved()})
+                if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('drained pass differs')
+                del iterator,value
+                phase(f'drained_pass{repeat}_validated')
+            save(a.output/'drained_stages.json',{'scope':'isolated stage submit/wait; perturbs scheduling; NOT GPU busy time or additive forward time',
+                 'runs':drained,'all_outputs_exact':True})
+        if a.measure_head:
+            head_runs=[]
+            for repeat in range(3):
+                iterator=iter(model.stages(color,0,window_batch=768,query_chunk=1024))
+                for b in range(a.measure_block):actual,value=next(iterator)
+                wait();torch.cuda.reset_peak_memory_stats()
+                prior=fused.counts() if fused else {}
+                begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                start=time.perf_counter();begin.record();actual,value=next(iterator);end.record();wait(end)
+                wall=(time.perf_counter()-start)*1000;event=begin.elapsed_time(end)
+                peak_live=torch.cuda.max_memory_allocated();peak_reserved=torch.cuda.max_memory_reserved()
+                if actual!=a.measure_block:raise RuntimeError('isolated module order differs')
+                after=fused.counts() if fused else {}
+                for _,value in iterator:pass
+                wait()
+                if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('isolated module output differs')
+                head_runs.append({'host_submit_wait_ms':wall,'gpu_stream_ms':event,
+                    'gpu_event_accepted_for_module_cost':False,
+                    'gpu_event_note':'Driver event spans can omit host submission gaps; use drained host submit/wait for module cost',
+                    'allocator_peak_live_bytes':peak_live,
+                    'allocator_peak_reserved_bytes':peak_reserved,
+                    'authored_counts':{k:after[k]-prior[k] for k in prior if isinstance(prior[k],int)},
+                    'gpu_total_dispatches':None,'output_exact':True})
+                del iterator,value,begin,end
+            name='head_times.json' if a.measure_block==70 else f'module{a.measure_block}_times.json'
+            save(a.output/name,{'scope':f'separate passes with GPU drain before and after block{a.measure_block}; stream interval includes submission gaps', 'runs':head_runs})
         if a.count_operators:
             # Instrumented run is NOT a latency sample or GPU dispatch measurement.
             with counter:
@@ -153,6 +212,12 @@ def exercise(a,phase):
             'host_warm_median_ms':statistics.median(r['host_forward_submit_wait_ms'] for r in runs[1:]) if len(runs)>1 else None,
             'gpu_dispatch_count':None,'gpu_busy_kernel_sum_ms':None,'gpu_profiler_available':False,
             'fusion_dll_sha256':sha(a.fusion_dll.read_bytes()) if a.fusion_dll else None,
+            'head_input_dll_sha256':sha(a.head_input_dll.read_bytes()) if a.head_input_dll else None,
+            'matrix_dll_sha256':sha(a.matrix_dll.read_bytes()) if a.matrix_dll else None,
+            'matrix_profile':a.matrix_profile,'matrix_waves':a.matrix_waves,
+            'matrix_modules':a.matrix_modules,
+            'pre_features_dll_sha256':sha(a.pre_features_dll.read_bytes()) if a.pre_features_dll else None,
+            'c32_layout_dll_sha256':sha(a.c32_layout_dll.read_bytes()) if a.c32_layout_dll else None,
             'reference_output_sha256':sha(a.reference_output.read_bytes()) if a.reference_output else None,
             'timing_scope':'Full-forward host submit/wait excludes finite checks and image readback; event span includes stream idle gaps and is not kernel busy sum',
             'fsr_applied':False,'rtx_quality_accepted':False,'temporal_quality_accepted':False,'game_runtime_ready':False}
@@ -177,17 +242,48 @@ def child(a):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--size',choices=('128','640','1080','1440','2160'),required=True)
+    p.add_argument('--size',choices=('128','640','1080','1440','2160','641','2342','3440'),required=True)
     p.add_argument('--iterations',type=int,choices=(1,3,12),default=3);p.add_argument('--count-operators',action='store_true');p.add_argument('--child',action='store_true')
     p.add_argument('--fusion-dll',type=Path);p.add_argument('--reference-output',type=Path)
+    p.add_argument('--head-input-dll',type=Path)
+    p.add_argument('--matrix-dll',type=Path)
+    p.add_argument('--matrix-profile',choices=('reference','wmma_fp16','wmma_fp8'),default='reference')
+    p.add_argument('--matrix-waves',type=int,choices=(1,2,4),default=1)
+    p.add_argument('--matrix-modules',default='head_ffn',help='comma-separated reviewed module names; policy rejects unknown values')
+    p.add_argument('--measure-head',action='store_true')
+    p.add_argument('--head-gather',action='store_true')
+    p.add_argument('--head-weight-cache',action='store_true')
+    p.add_argument('--head-epilogue',action='store_true')
+    p.add_argument('--head-qkv',action='store_true')
+    p.add_argument('--pre-features-dll',type=Path)
+    p.add_argument('--c32-layout-dll',type=Path)
+    p.add_argument('--measure-block',type=int,choices=(0,2,70),default=70)
     p.add_argument('--stage-timestamps',action='store_true')
+    p.add_argument('--drain-stages',action='store_true')
     a=p.parse_args()
+    if (a.head_epilogue or a.head_gather or a.head_qkv) and not a.head_input_dll:p.error('head kernel options require --head-input-dll')
     if a.fusion_dll and not a.reference_output:p.error('fusion requires same-input baseline reference output')
+    if a.head_input_dll and not a.reference_output:p.error('head fusion requires same-input reference')
+    if a.pre_features_dll and not a.reference_output:p.error('pre fusion requires same-input reference')
+    if a.c32_layout_dll and not a.reference_output:p.error('C32 fusion requires same-input reference')
+    if a.matrix_profile!='reference' and (not a.matrix_dll or not a.reference_output):p.error('matrix candidate requires DLL and explicit reference')
     if a.child:raise SystemExit(0 if child(a) else 2)
     a.output.mkdir(parents=True,exist_ok=False);fixture(a.output,a.size)
     command=[sys.executable,str(Path(__file__).resolve()),'--child','--output',str(a.output.resolve()),'--size',a.size,'--iterations',str(a.iterations)]
     if a.count_operators:command.append('--count-operators')
     if a.stage_timestamps:command.append('--stage-timestamps')
+    if a.drain_stages:command.append('--drain-stages')
     if a.fusion_dll:command+=['--fusion-dll',str(a.fusion_dll.resolve())]
+    if a.head_input_dll:command+=['--head-input-dll',str(a.head_input_dll.resolve())]
+    if a.matrix_dll:command+=['--matrix-dll',str(a.matrix_dll.resolve())]
+    command+=['--matrix-profile',a.matrix_profile,'--matrix-waves',str(a.matrix_waves),'--matrix-modules',a.matrix_modules]
+    if a.measure_head:command+=['--measure-head']
+    command+=['--measure-block',str(a.measure_block)]
+    if a.head_gather:command+=['--head-gather']
+    if a.head_weight_cache:command+=['--head-weight-cache']
+    if a.head_epilogue:command+=['--head-epilogue']
+    if a.head_qkv:command+=['--head-qkv']
+    if a.pre_features_dll:command+=['--pre-features-dll',str(a.pre_features_dll.resolve())]
+    if a.c32_layout_dll:command+=['--c32-layout-dll',str(a.c32_layout_dll.resolve())]
     if a.reference_output:command+=['--reference-output',str(a.reference_output.resolve())]
     raise SystemExit(0 if supervise(command,a.output,timeout=180) else 2)

@@ -1,5 +1,14 @@
 # Native fusion probe (not enabled by default)
 
+The completed opt-in gfx1201 matrix candidates, accepted/rejected module table,
+ISA resources, full-frame gates and current reproduction commands are documented
+in [RDNA4 matrix fusion results](../../docs/RDNA4_MATRIX_FUSION_RESULTS.md).
+
+Head input/compose, residual epilogue, QKV normalization/quantization, Pre features,
+C32 layout and matrix-family exports are present. Current exact gates, graph counts,
+accepted/rejected candidates and complete commands are consolidated in
+[RDNA4 matrix fusion results](../../docs/RDNA4_MATRIX_FUSION_RESULTS.md).
+
 First bounded candidate: `quantize_e4` for contiguous FP16 inference tensors.
 The existing expression materializes clamp, E4M3 cast and FP16 cast outputs.
 This kernel uses integer IEEE bit manipulation for the same rounding and

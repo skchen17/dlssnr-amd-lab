@@ -74,6 +74,10 @@ class SplitFFWD512(nn.Module):
     def forward(self, matrix_a_features):
         require_features(matrix_a_features, self.preproject.device)
         projected = chunked_linear(matrix_a_features, self.preproject)
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion()
+        if matrix is not None and 'c512_ffn' in matrix.modules:
+            return matrix.c512_group_ffn(self,projected)
         grouped = projected.reshape(-1, 64, 8, 64).transpose(1, 2)
         hidden = chunked_linear(grouped[..., self.perm64], self.expand)
         hidden = cubic_silu(hidden)

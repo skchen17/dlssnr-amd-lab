@@ -33,6 +33,13 @@ def quantize_e4(x):
     return x + (rounded - x).detach() if x.requires_grad else rounded
 
 
+def quantized_gather(x,index):
+    from native_head_fusion import active_head_fusion
+    fusion=active_head_fusion()
+    if fusion is not None and fusion.in_block:return fusion.gather_e4(x,index)
+    return quantize_e4(x[...,index])
+
+
 def decode_e4(raw: bytes):
     return torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(torch.float8_e4m3fn).half()
 
@@ -74,6 +81,7 @@ class RecoveredSwin32(nn.Module):
 
     def __init__(self, packed_weights: bytes, *, record_kind='swin32'):
         super().__init__()
+        self.record_kind=record_kind
         self.inference_cache_enabled=False
         self._inference_weights={}
         sizes = {'swin32': 20672, 'head32': 21808}
@@ -148,22 +156,35 @@ class RecoveredSwin32(nn.Module):
 
     def forward_ffn(self, raw_windows):
         """Expose the logical FFN boundary for native-family cross checks."""
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion()
+        if matrix is not None and self.record_kind=='head32' and 'head_ffn' in matrix.modules:
+            return matrix.head_ffn(self,raw_windows)
         if raw_windows.ndim != 2 or raw_windows.shape[1] != 2048 or raw_windows.dtype != torch.float16:
             raise ValueError('expected [windows,2048] decoded FP16 packed features')
-        a = quantize_e4(raw_windows[:, self.a_index])
+        a = quantized_gather(raw_windows, self.a_index)
         x = (a[:, None] @ self._weight('expand')).half()
         from native_grouped_ffn import quantized_cubic_silu
         hidden = quantized_cubic_silu(x)
         first_output = (raw_windows[:, self.residual_index] * self.ffn_scale).half()
+        from native_head_fusion import active_head_fusion
+        fusion=active_head_fusion()
         for p in range(4):
             # Preserve per-32-channel accumulation boundaries, not per-instruction rounding.
             product = hidden[:, p, :, self.permutation].float() @ self._weight('contract',part=p,fp32=True)
-            first_output = (first_output.float() + product).half()
+            first_output = fusion.add(first_output,product) if fusion is not None and fusion.epilogue_active else (first_output.float() + product).half()
         return first_output
 
     def forward(self, raw_windows):
+        from native_head_fusion import active_head_fusion
+        fusion=active_head_fusion()
+        epilogue=fusion is not None and fusion.epilogue_active
         first_output = self.forward_ffn(raw_windows)
-        projection = (quantize_e4(first_output[:, :, self.permutation]) @ self._weight('qkv')).half()
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion()
+        if matrix is not None and self.record_kind=='head32' and 'head_attention' in matrix.modules:
+            projection=matrix.head_qkv(self,first_output)
+        else:projection = (quantized_gather(first_output,self.permutation) @ self._weight('qkv')).half()
         q, k, v = projection.chunk(3, dim=-1)
         def norm(t):
             squares = (t * t).half()
@@ -171,13 +192,28 @@ class RecoveredSwin32(nn.Module):
                 squares = (squares[..., 0::2] + squares[..., 1::2]).half()
             inv = squares.float().clamp_min(6.198883056640625e-5).rsqrt().half()
             return (t * inv).half()
-        q = quantize_e4((norm(q) * self.q_scale).half())
-        k = quantize_e4(norm(k))
-        scores = (q.float() @ k.float().transpose(-1, -2) + self._weight('position_bias',fp32=True,quantized=False)).half()
-        probability = quantize_e4(torch.softmax(scores.float(), dim=-1).half())
-        v = quantize_e4(v)
-        attention = (probability[..., :32].float() @ v[..., :32, :].float()).half()
-        attention = (attention.float() + probability[..., 32:].float() @ v[..., 32:, :].float()).half()
-        seed = (first_output * self.attention_scale).half()
-        projected = quantize_e4(attention[..., self.permutation]).float() @ self._weight('project',fp32=True)
+        qkv_fused=fusion is not None and fusion.qkv_active
+        if qkv_fused:q,k,v=fusion.qkv(projection,self.q_scale)
+        else:
+            q = quantize_e4((norm(q) * self.q_scale).half())
+            k = quantize_e4(norm(k))
+        if matrix is not None and self.record_kind=='head32' and 'head_attention' in matrix.modules:
+            scores=matrix.head_scores(self,q,k)
+        else:scores = (q.float() @ k.float().transpose(-1, -2) + self._weight('position_bias',fp32=True,quantized=False)).half()
+        if matrix is not None and self.record_kind=='head32' and 'head_softmax' in matrix.modules:
+            probability=matrix.head_probability(scores)
+        else:probability = quantize_e4(torch.softmax(scores.float(), dim=-1).half())
+        if not qkv_fused:v = quantize_e4(v)
+        if matrix is not None and self.record_kind=='head32' and 'head_attention' in matrix.modules:
+            attention=matrix.head_pv(probability,v)
+        else:
+            attention = (probability[..., :32].float() @ v[..., :32, :].float()).half()
+            second=probability[..., 32:].float() @ v[..., 32:, :].float()
+            attention = fusion.add(attention,second) if epilogue else (attention.float()+second).half()
+            del second
+        if matrix is not None and self.record_kind=='head32' and 'head_output' in matrix.modules:
+            return matrix.head_project(self,first_output,attention)
+        if not epilogue:seed=(first_output*self.attention_scale).half()
+        projected = quantized_gather(attention,self.permutation).float() @ self._weight('project',fp32=True)
+        if epilogue:return fusion.add(first_output,projected,self.attention_scale)
         return (seed.float() + projected).half()
