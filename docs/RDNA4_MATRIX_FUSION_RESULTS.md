@@ -100,6 +100,17 @@ TDR 修改或 CPU 神经算子回退。当前结果只关闭本轮“候选实�
 4K 输出仍为 `46F357EC1DA510A7CB7BC6D141E8A83DBA4DAD24179D72DC18BD150CD573056F`。
 审计时游戏未运行，也没有遗留本项目 GPU 验证进程。
 
+## 2026-09-07 Swin 主干增量
+
+后续低LDS主干重构不再沿用完整4C hidden LDS方案。C64/C128/C256 grouped FFN在
+144窗口12次中位数分别达到2.47×、1.57×、1.33×，并在1080p B-A-B-A中把当前
+reference的1031.478 ms降至902.266 ms（−12.527%），输出哈希完全一致。C32
+conservative core、C64/C128 bounded/query attention均因代表规模回退而拒绝。
+
+resident E4M3权重和原生`NRPlan` Graph基础也已实现并通过最小门，但前者最高可靠收益
+只有2.49%，后者尚未迁入完整网络。完整数据、资源表、复现命令和结论边界见
+[`RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md`](RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md)。
+
 ## 复现
 
 仓库根目录 PowerShell。必须已有本地私有模型和参考；每次使用新的输出目录。GPU串行，

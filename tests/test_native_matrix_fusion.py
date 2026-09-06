@@ -21,12 +21,17 @@ def test_profiles_and_unimplemented_modules_fail_closed():
             validate_config(profile,('head_ffn','head_attention','head_softmax','head_output','c64_ffn','c128_ffn'),waves)
             validate_config(profile,('c64_ffn','c64_attention','c128_ffn','c128_attention'),waves)
             validate_config(profile,('c64_ffn','c64_attention_bounded','c128_ffn','c128_attention_bounded'),waves)
+            validate_config(profile,('c64_ffn_grouped','c64_attention_query','c128_ffn_grouped','c128_attention_query'),waves)
             validate_config(profile,('c256_ffn',),waves)
+            validate_config(profile,('c64_ffn_grouped','c128_ffn_grouped','c256_ffn_grouped'),waves)
             validate_config(profile,('c512_ffn',),waves)
     for args in [('other',('head_ffn',),1),('wmma_fp8',('vit',),1),('reference',('head_ffn',),3)]:
         with pytest.raises(ValueError):validate_config(*args)
     with pytest.raises(ValueError,match='exactly one C32'):
         validate_config('wmma_fp16',('c32_attention_bounded','c32_attention_staged'),2)
+    validate_config('wmma_fp8',('c64_ffn_grouped_fp8w','c128_ffn_grouped_fp8w','c256_ffn_grouped_fp8w'),1)
+    with pytest.raises(ValueError,match='resident FP8 weights'):
+        validate_config('wmma_fp16',('c64_ffn_grouped_fp8w',),1)
 
 
 def test_reference_is_noop_and_candidates_require_dll():

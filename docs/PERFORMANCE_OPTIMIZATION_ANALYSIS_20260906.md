@@ -156,18 +156,18 @@ ABI和CPU策略检查，尚未通过GPU门，不能启用。
 
 ## 7. FP8、常驻数据与原生运行时状态
 
-当前 `wmma_fp8` 候选确实生成 gfx1201 FP8 WMMA，但仍在kernel入口附近把已解码FP16
-转换/打包为FP8，并不是真正的resident FP8数据路径。已经完成的是权重缓存失效规则、
-显式精度策略和FP8/FP16双轨基础设施；尚未完成的是：
+当前 `wmma_fp8` 候选确实生成 gfx1201 FP8 WMMA。2026-09-07 已新增 grouped FFN
+resident-weight候选：expand/contract权重在初始化阶段保存为E4M3字节并由WMMA直接读取。
+C128/144窗口十二次只取得2.49%收益，未过5%门，因此不默认启用。尚未完成的是：
 
-- 初始化时永久预打包FP8权重；
 - 只在语义允许的位置让activation以FP8格式常驻；
 - 跨kernel直接消费FP8，取消FP8→FP16→FP8往返；
 - 用原生workspace arena统一管理生命周期。
 
-Python仍是reference oracle、correctness harness和当前部署桥。固定C++/HIP `NRPlan`、统一
-workspace arena、参数预绑定和HIP Graph重放尚未完成，因此完整帧仍承担Python对象、动态
-allocation和提交间隙。这是后续整帧数量级优化的必要工作，而不是可选收尾。
+Python仍是reference oracle、correctness harness和当前部署桥。已新增可编译的C++/HIP
+`NRPlan`基础，完成固定workspace/权重、设备端帧绑定表、一次capture和graph replay marker
+自测；完整71-block kernel sequence尚未迁入，因此完整帧仍承担Python对象、动态allocation
+和提交间隙。这是后续整帧数量级优化的必要工作，而不是已完成的部署路径。
 
 ## 8. 显存与4K结果
 

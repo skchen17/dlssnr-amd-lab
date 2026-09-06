@@ -77,11 +77,23 @@ class RecoveredPackedSwin(nn.Module):
         from native_matrix_fusion import active_matrix_fusion
         matrix=active_matrix_fusion()
         family=f'c{self.channels}_ffn'
+        grouped_family=f'{family}_grouped'
+        resident_grouped_family=f'{grouped_family}_fp8w'
+        if matrix is not None and self.channels in (64,128,256) and ({grouped_family,resident_grouped_family}&matrix.modules):
+            post=matrix.wide_group_ffn(self,windows)
+            attention_family=f'c{self.channels}_attention'
+            bounded_family=f'c{self.channels}_attention_bounded'
+            query_family=f'c{self.channels}_attention_query'
+            if bounded_family in matrix.modules:return matrix.wide_attention_bounded(self.block.attention,post)
+            if query_family in matrix.modules:return matrix.wide_attention_query(self.block.attention,post)
+            return matrix.wide_attention(self.block.attention,post) if attention_family in matrix.modules else self.block.attention(post)
         if matrix is not None and self.channels in (64,128,256) and family in matrix.modules:
             post=matrix.wide_ffn(self,windows)
             attention_family=f'c{self.channels}_attention'
             bounded_family=f'c{self.channels}_attention_bounded'
+            query_family=f'c{self.channels}_attention_query'
             if bounded_family in matrix.modules:return matrix.wide_attention_bounded(self.block.attention,post)
+            if query_family in matrix.modules:return matrix.wide_attention_query(self.block.attention,post)
             return matrix.wide_attention(self.block.attention,post) if attention_family in matrix.modules else self.block.attention(post)
         attention_family=f'c{self.channels}_attention'
         if matrix is not None and self.channels in (64,128) and attention_family in matrix.modules:
@@ -91,6 +103,10 @@ class RecoveredPackedSwin(nn.Module):
         if matrix is not None and self.channels in (64,128) and bounded_family in matrix.modules:
             post=self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index])
             return matrix.wide_attention_bounded(self.block.attention,post)
+        query_family=f'c{self.channels}_attention_query'
+        if matrix is not None and self.channels in (64,128) and query_family in matrix.modules:
+            post=self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index])
+            return matrix.wide_attention_query(self.block.attention,post)
         if matrix is not None and self.channels==32 and 'c32_ffn' in matrix.modules:
             post=matrix.c32_ffn(self,windows)
             if 'c32_attention_staged' in matrix.modules:return matrix.c32_attention_staged(self.block.attention,post)

@@ -1,4 +1,4 @@
-"""Strict isolated gate for bounded-LDS C64/C128 attention.
+"""Strict isolated gate for bounded or query-tiled C64/C128 attention.
 
 The safety guard runs before a child process or HIP runtime is started.  This
 script intentionally validates one channel family per process so a failed gate
@@ -77,7 +77,8 @@ def exercise(args):
     stream = torch.cuda.current_stream()
 
     def run(attention_family):
-        modules = (f"c{args.channels}_ffn", attention_family)
+        ffn_family = f"c{args.channels}_ffn" + ("_grouped" if args.ffn_strategy == "grouped" else "")
+        modules = (ffn_family, attention_family)
         torch.cuda.reset_peak_memory_stats()
         with torch.no_grad(), execution_policy("native_fp16"), fusion_policy(args.quant_dll), matrix_fusion(
             args.matrix_dll, "wmma_fp16", modules=modules, waves=args.waves
@@ -109,11 +110,16 @@ def exercise(args):
         return result, row
 
     baseline, baseline_row = run(f"c{args.channels}_attention")
-    candidate, candidate_row = run(f"c{args.channels}_attention_bounded")
+    candidate_name = f"c{args.channels}_attention_{args.candidate}"
+    candidate, candidate_row = run(candidate_name)
     equality = compare(baseline, candidate)
     return {
         "checks_pass": equality["bitwise_exact"],
-        "scope": f"same C{args.channels} FFN; six global attention stages versus bounded per-head LDS plus projection",
+        "scope": (f"same C{args.channels} {args.ffn_strategy} FFN; six global attention stages versus "
+                  + ("20 KiB per-head fused attention plus projection" if args.candidate == "bounded" else
+                     "2 KiB per-(head,16-query) QK/softmax/PV plus independent QKV/norm/projection")),
+        "candidate_strategy": args.candidate,
+        "ffn_strategy": args.ffn_strategy,
         "channels": args.channels,
         "record_key": list(record_key),
         "windows": args.windows,
@@ -139,7 +145,9 @@ def child(args):
     import ctypes as ct
 
     dll = ct.CDLL(str(args.matrix_dll.resolve()))
-    required = (f"nr_c{args.channels}_ffn_wmma", f"nr_c{args.channels}_attention_head_fused")
+    ffn_symbol = f"nr_c{args.channels}_" + ("group_ffn_wmma" if args.ffn_strategy == "grouped" else "ffn_wmma")
+    attention_symbol = f"nr_c{args.channels}_attention_" + ("head_fused" if args.candidate == "bounded" else "query_fused")
+    required = (ffn_symbol, attention_symbol)
     for symbol in required:
         if not hasattr(dll, symbol):
             raise ValueError(f"missing required symbol {symbol}")
@@ -167,7 +175,9 @@ def main():
     parser.add_argument("--matrix-dll", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--channels", type=int, choices=(64, 128), required=True)
-    parser.add_argument("--windows", type=int, choices=(1, 64, 256), required=True)
+    parser.add_argument("--windows", type=int, choices=(1, 16, 64, 144, 256), required=True)
+    parser.add_argument("--candidate", choices=("bounded", "query"), default="bounded")
+    parser.add_argument("--ffn-strategy", choices=("legacy", "grouped"), default="legacy")
     parser.add_argument("--waves", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--iterations", type=int, choices=(1, 12), default=12)
     parser.add_argument("--child", action="store_true")
@@ -190,6 +200,10 @@ def main():
         str(args.channels),
         "--windows",
         str(args.windows),
+        "--candidate",
+        args.candidate,
+        "--ffn-strategy",
+        args.ffn_strategy,
         "--waves",
         str(args.waves),
         "--iterations",

@@ -431,6 +431,123 @@ template<int C,int WAVES,bool FP8> __global__ void wide_ffn_wmma(
     for(int m=0;m<C/16;++m){F8 acc={};for(int ck=0;ck<C/16;++ck){H8 a,b;for(int e=0;e<8;++e){int kk=ck*16+group*8+e;a[e]=mix[kk*C+m*16+token];b[e]=quant(storage[wave][(ck/2*32+perm[kk%32])*16+token]);}acc=mma<FP8>(a,b,acc);}if(active)for(int e=0;e<8;++e){int c=m*16+group*8+e;_Float16 seed=rnd(float(raw[window*64*C+ri[row*C+c]])*float(scale[c]));output[(window*64+row)*C+c]=rnd(float(rnd(acc[e]))+float(seed));}}
 }
 
+// Resident-weight FP8 primitive. The A operand is already stored as eight
+// E4M3 bytes, so the hot kernel only converts the activation operand. This is
+// intentionally narrower than a "fully resident FP8" claim: FP16 semantic
+// boundaries and the library CxC mix remain unchanged.
+__device__ static F8 mma_fp8_resident_a(I2 packed_a,H8 b,F8 c) {
+    I2 packed_b={};
+    for(int i=0;i<8;++i)
+        packed_b[i/4]|=unsigned(e4(float(b[i])))<<((i%4)*8);
+    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+        packed_a,packed_b,c);
+}
+
+// Low-LDS grouped FFN stage for C64/C128/C256.  A workgroup owns exactly one
+// (window, head, 16-token tile) task.  It computes C -> 128 -> 32 for that
+// head, quantizes at the established pre-mix boundary, and writes the mix
+// operand plus residual seed.  The cross-head C -> C mix intentionally stays
+// in the caller's library GEMM instead of serializing every head in one wave.
+template<int C,bool FP8> __global__ void wide_group_ffn_wmma(
+    const _Float16* raw,const _Float16* expand,const _Float16* contract,
+    const _Float16* scale,const int64_t* ai,const int64_t* ri,
+    const int64_t* perm,const int64_t* inverse_perm,
+    _Float16* grouped,_Float16* seed,int windows) {
+    __shared__ _Float16 hidden[128*16];
+    constexpr int HEADS=C/32;
+    int lane=threadIdx.x,token=lane%16,half=lane/16;
+    int task=blockIdx.x,head=task%HEADS,tile=task/HEADS;
+    int window=tile/4,row=tile%4*16+token;
+    if(window>=windows)return;
+    for(int m=0;m<8;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<C/16;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+half*8+e;
+                int hidden_col=head*128+m*16+token;
+                a[e]=expand[kk*(4*C)+hidden_col];
+                b[e]=quant(raw[window*64*C+ai[row*C+kk]]);
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)
+            hidden[(m*16+half*8+e)*16+token]=cubic(rnd(acc[e]));
+    }
+    __syncthreads();
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int part=0;part<4;++part)for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+half*8+e,k=part*32+kk;
+                a[e]=contract[(head*128+k)*32+m*16+token];
+                b[e]=hidden[(part*32+perm[kk])*16+token];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int local=m*16+half*8+e,channel=head*32+local;
+            int mix_input=head*32+inverse_perm[local];
+            grouped[(window*64+row)*C+mix_input]=quant(rnd(acc[e]));
+            seed[(window*64+row)*C+channel]=
+                rnd(float(raw[window*64*C+ri[row*C+channel]])*float(scale[channel]));
+        }
+    }
+}
+
+// Same mathematical boundaries and grid as wide_group_ffn_wmma<...,true>,
+// but expand/contract weights are initialized once as resident E4M3 bytes.
+// The grouped result remains the established E4M3-rounded FP16 representation
+// because the following library GEMM currently consumes FP16.
+template<int C> __global__ void wide_group_ffn_fp8w(
+    const _Float16* raw,const uint8_t* expand,const uint8_t* contract,
+    const _Float16* scale,const int64_t* ai,const int64_t* ri,
+    const int64_t* perm,const int64_t* inverse_perm,
+    _Float16* grouped,_Float16* seed,int windows) {
+    __shared__ _Float16 hidden[128*16];
+    constexpr int HEADS=C/32;
+    int lane=threadIdx.x,token=lane%16,half=lane/16;
+    int task=blockIdx.x,head=task%HEADS,tile=task/HEADS;
+    int window=tile/4,row=tile%4*16+token;
+    if(window>=windows)return;
+    for(int m=0;m<8;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<C/16;++chunk) {
+            I2 packed_weight={};H8 activation;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+half*8+e;
+                int hidden_col=head*128+m*16+token;
+                packed_weight[e/4]|=unsigned(expand[kk*(4*C)+hidden_col])<<((e%4)*8);
+                activation[e]=quant(raw[window*64*C+ai[row*C+kk]]);
+            }
+            acc=mma_fp8_resident_a(packed_weight,activation,acc);
+        }
+        for(int e=0;e<8;++e)
+            hidden[(m*16+half*8+e)*16+token]=cubic(rnd(acc[e]));
+    }
+    __syncthreads();
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int part=0;part<4;++part)for(int chunk=0;chunk<2;++chunk) {
+            I2 packed_weight={};H8 activation;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+half*8+e,k=part*32+kk;
+                packed_weight[e/4]|=unsigned(contract[(head*128+k)*32+m*16+token])<<((e%4)*8);
+                activation[e]=hidden[(part*32+perm[kk])*16+token];
+            }
+            acc=mma_fp8_resident_a(packed_weight,activation,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int local=m*16+half*8+e,channel=head*32+local;
+            int mix_input=head*32+inverse_perm[local];
+            grouped[(window*64+row)*C+mix_input]=quant(rnd(acc[e]));
+            seed[(window*64+row)*C+channel]=
+                rnd(float(raw[window*64*C+ri[row*C+channel]])*float(scale[channel]));
+        }
+    }
+}
+
 // C512 uses a different four-record block.  Only its eight independent
 // 64->256->64 grouped MLPs are fused here; the surrounding 512x512 projections
 // remain library GEMMs so this candidate does not require a full-window LDS
@@ -714,6 +831,68 @@ template<int C,bool FP8> __global__ void wide_attention_head_fused(
     }
 }
 
+// Conservative wide-family attention core. QKV projection and normalization
+// remain in their established parallel kernels. One single-wave workgroup owns
+// (window, head, 16-query tile), keeping only 16x64 scores/probabilities in
+// 2 KiB LDS while fusing QK, E4M3 softmax and PV.
+template<int C,bool FP8> __global__ void wide_attention_query_fused(
+    const _Float16* q,const _Float16* k,const _Float16* v,
+    const _Float16* position_bias,_Float16* value,int windows) {
+    __shared__ _Float16 scores[16*64];
+    constexpr int HEADS=C/32;
+    int lane=threadIdx.x,query=lane%16,group=lane/16;
+    int task=blockIdx.x,head=task%HEADS,tile=task/HEADS;
+    int window=tile/4,query_tile=tile%4,row=query_tile*16+query;
+    if(window>=windows)return;
+    size_t base=(size_t(window)*HEADS+head)*64;
+    for(int kt=0;kt<4;++kt) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e,key=kt*16+query;
+                a[e]=k[(base+key)*32+kk];
+                b[e]=q[(base+row)*32+kk];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int key=kt*16+group*8+e;
+            scores[query*64+key]=rnd(float(rnd(acc[e]))+
+                float(position_bias[(head*64+row)*64+key]));
+        }
+    }
+    __syncthreads();
+    for(int local=0;local<16;++local) {
+        float x0=float(scores[local*64+lane]);
+        float x1=float(scores[local*64+lane+32]);
+        float maximum=fmaxf(x0,x1);
+        for(int offset=16;offset;offset>>=1)
+            maximum=fmaxf(maximum,__shfl_down(maximum,offset,32));
+        maximum=__shfl(maximum,0,32);
+        float e0=expf(x0-maximum),e1=expf(x1-maximum),sum=e0+e1;
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down(sum,offset,32);
+        sum=__shfl(sum,0,32);
+        scores[local*64+lane]=quant(rnd(e0/sum));
+        scores[local*64+lane+32]=quant(rnd(e1/sum));
+    }
+    __syncthreads();
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<4;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int key=chunk*16+group*8+e,channel=m*16+query;
+                a[e]=v[(base+key)*32+channel];
+                b[e]=scores[query*64+key];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)
+            value[(base+row)*32+m*16+group*8+e]=rnd(acc[e]);
+    }
+}
+
 __global__ void pre_project_exact(const _Float16* input,const _Float16* weight,
     _Float16* output,size_t rows) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=rows*32)return;
@@ -955,6 +1134,99 @@ extern "C" __declspec(dllexport) int nr_c128_attention_head_fused(const void* po
     const void* qscale,const void* bias,const void* perm,void* value,int windows,int fp8,void* stream) {
     return wide_attention_head_entry<128>(post,qkv,qscale,bias,perm,value,windows,fp8,stream);
 }
+
+template<int C,bool FP8> static void launch_wide_attention_query(
+    const void* q,const void* k,const void* v,const void* bias,void* value,
+    int windows,void* stream) {
+    hipLaunchKernelGGL((wide_attention_query_fused<C,FP8>),dim3(windows*(C/32)*4),dim3(32),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(q),
+        static_cast<const _Float16*>(k),static_cast<const _Float16*>(v),
+        static_cast<const _Float16*>(bias),static_cast<_Float16*>(value),windows);
+}
+template<int C> static int wide_attention_query_entry(
+    const void* q,const void* k,const void* v,const void* bias,void* value,
+    int windows,int fp8,void* stream) {
+    if(!q||!k||!v||!bias||!value||windows<1||windows>262144||(fp8!=0&&fp8!=1))
+        return int(hipErrorInvalidValue);
+    if(fp8)launch_wide_attention_query<C,true>(q,k,v,bias,value,windows,stream);
+    else launch_wide_attention_query<C,false>(q,k,v,bias,value,windows,stream);
+    return int(hipGetLastError());
+}
+#define QUERY_ATTN_EXPORT(C) \
+extern "C" __declspec(dllexport) int nr_c##C##_attention_query_fused( \
+    const void* q,const void* k,const void* v,const void* bias,void* value, \
+    int windows,int fp8,void* stream) { \
+    return wide_attention_query_entry<C>(q,k,v,bias,value,windows,fp8,stream); \
+}
+QUERY_ATTN_EXPORT(64)
+QUERY_ATTN_EXPORT(128)
+#undef QUERY_ATTN_EXPORT
+
+template<int C,bool FP8> static void launch_wide_group_ffn(
+    const void* raw,const void* expand,const void* contract,const void* scale,
+    const void* ai,const void* ri,const void* perm,const void* inverse_perm,
+    void* grouped,void* seed,int windows,void* stream) {
+    hipLaunchKernelGGL((wide_group_ffn_wmma<C,FP8>),dim3(windows*(C/32)*4),dim3(32),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(raw),
+        static_cast<const _Float16*>(expand),static_cast<const _Float16*>(contract),
+        static_cast<const _Float16*>(scale),static_cast<const int64_t*>(ai),
+        static_cast<const int64_t*>(ri),static_cast<const int64_t*>(perm),
+        static_cast<const int64_t*>(inverse_perm),static_cast<_Float16*>(grouped),
+        static_cast<_Float16*>(seed),windows);
+}
+template<int C> static int wide_group_ffn_entry(
+    const void* raw,const void* expand,const void* contract,const void* scale,
+    const void* ai,const void* ri,const void* perm,const void* inverse_perm,
+    void* grouped,void* seed,int windows,int fp8,void* stream) {
+    if(!raw||!expand||!contract||!scale||!ai||!ri||!perm||!inverse_perm||
+       !grouped||!seed||windows<1||windows>262144||(fp8!=0&&fp8!=1))
+        return int(hipErrorInvalidValue);
+    if(fp8)launch_wide_group_ffn<C,true>(raw,expand,contract,scale,ai,ri,perm,
+        inverse_perm,grouped,seed,windows,stream);
+    else launch_wide_group_ffn<C,false>(raw,expand,contract,scale,ai,ri,perm,
+        inverse_perm,grouped,seed,windows,stream);
+    return int(hipGetLastError());
+}
+#define GROUP_FFN_EXPORT(C) \
+extern "C" __declspec(dllexport) int nr_c##C##_group_ffn_wmma( \
+    const void* raw,const void* expand,const void* contract,const void* scale, \
+    const void* ai,const void* ri,const void* perm,const void* inverse_perm, \
+    void* grouped,void* seed,int windows,int fp8,void* stream) { \
+    return wide_group_ffn_entry<C>(raw,expand,contract,scale,ai,ri,perm,inverse_perm, \
+        grouped,seed,windows,fp8,stream); \
+}
+GROUP_FFN_EXPORT(64)
+GROUP_FFN_EXPORT(128)
+GROUP_FFN_EXPORT(256)
+#undef GROUP_FFN_EXPORT
+
+template<int C> static int wide_group_ffn_fp8w_entry(
+    const void* raw,const void* expand,const void* contract,const void* scale,
+    const void* ai,const void* ri,const void* perm,const void* inverse_perm,
+    void* grouped,void* seed,int windows,void* stream) {
+    if(!raw||!expand||!contract||!scale||!ai||!ri||!perm||!inverse_perm||
+       !grouped||!seed||windows<1||windows>262144)return int(hipErrorInvalidValue);
+    hipLaunchKernelGGL((wide_group_ffn_fp8w<C>),dim3(windows*(C/32)*4),dim3(32),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(raw),
+        static_cast<const uint8_t*>(expand),static_cast<const uint8_t*>(contract),
+        static_cast<const _Float16*>(scale),static_cast<const int64_t*>(ai),
+        static_cast<const int64_t*>(ri),static_cast<const int64_t*>(perm),
+        static_cast<const int64_t*>(inverse_perm),static_cast<_Float16*>(grouped),
+        static_cast<_Float16*>(seed),windows);
+    return int(hipGetLastError());
+}
+#define GROUP_FFN_FP8W_EXPORT(C) \
+extern "C" __declspec(dllexport) int nr_c##C##_group_ffn_fp8w( \
+    const void* raw,const void* expand,const void* contract,const void* scale, \
+    const void* ai,const void* ri,const void* perm,const void* inverse_perm, \
+    void* grouped,void* seed,int windows,void* stream) { \
+    return wide_group_ffn_fp8w_entry<C>(raw,expand,contract,scale,ai,ri,perm,inverse_perm, \
+        grouped,seed,windows,stream); \
+}
+GROUP_FFN_FP8W_EXPORT(64)
+GROUP_FFN_FP8W_EXPORT(128)
+GROUP_FFN_FP8W_EXPORT(256)
+#undef GROUP_FFN_FP8W_EXPORT
 
 template<int C,int W,bool FP8> static void launch_wide(const void* raw,const void* expand,
     const void* contract,const void* mix,const void* scale,const void* ai,const void* ri,

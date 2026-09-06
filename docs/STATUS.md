@@ -1,9 +1,11 @@
 # 当前状态
 
-更新时间：2026-09-06。
+更新时间：2026-09-07。
 
 截至当前的完整性能优化分析见
 [`PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md`](PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md)。
+最新 Swin 主干重构实测见
+[`RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md`](RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md)。
 
 ## 已完成
 
@@ -34,6 +36,15 @@
 - C32低LDS三段候选静态占用改善到62.5%/75%，但单窗口仍因QKV归一化串行化而
   0.32934 ms 对0.15870 ms，已拒绝。当前保留8 KiB QK/softmax/PV核心，另建复用既有
   并行QKV/norm的保守四段候选；CPU/ABI已通过，尚未运行GPU门。
+- C32保守核心已经完成GPU门：16窗口从0.18870增至0.26456 ms，尽管launch 7→5且
+  逐位一致，仍按规则拒绝。
+- C64/C128/C256新 grouped FFN 以`(window,head,16-token tile)`并行，固定4 KiB LDS；
+  144窗口12次中位数分别取得2.47×、1.57×、1.33×加速，全部逐位一致。1080p
+  B-A-B-A整帧中位数1031.478→902.266 ms（−12.527%），这是当前可保留的显式候选。
+- C64/C128 attention的20 KiB per-head和2 KiB query-tile两案均未在代表规模稳定胜出，
+  已拒绝且未复制到C256。
+- 已建立E4M3 resident-weight路径和C++/HIP `NRPlan`固定arena/Graph基础。前者C128仅
+  提速2.49%，未晋级；后者marker graph自测通过，但尚未装入完整71-block网络。
 
 ## 尚未完成
 
@@ -45,6 +56,8 @@
   最小门禁执行。
 - Pre 与跨 stage 数据流的进一步融合，以及后续 ViT 性能研究。
 - 游戏原生常驻执行器的最终 pre-HUD 接入和安全回退复验。
+- 将已通过的grouped FFN/transition/Head/Pre逐模块迁入原生`NRPlan`，并建立真正跨
+  kernel的resident FP8 activation；当前两者都只有基础设施，不能宣称整帧迁移完成。
 
 ## 当前实验配置
 
@@ -60,6 +73,7 @@ modules=head_ffn,head_attention,head_softmax,head_output,c32_ffn,c32_attention,c
 ## 关键文档
 
 - [RDNA4 矩阵融合结果](RDNA4_MATRIX_FUSION_RESULTS.md)
+- [RDNA4 Swin 主干重构结果](RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md)
 - [RDNA4 原生引擎重构进度](RDNA4_NATIVE_ENGINE_REFACTOR.md)
 - [GPU profiling 安全事件](GPU_PROFILING_INCIDENT_20260906.md)
 - [NVIDIA 与 RDNA4 执行映射](NVIDIA_RDNA4_MAPPING.md)
@@ -71,7 +85,7 @@ modules=head_ffn,head_attention,head_softmax,head_output,c32_ffn,c32_attention,c
 
 ## 完整性检查
 
-- 本地完整环境 CPU 回归：`843 passed in 66.22s`。
+- 本地完整环境 CPU 回归：`876 passed in 71.47s`。
 - 公开快照：本轮新增/修改相关测试 `28 passed`；全套 `834 passed, 9 failed`，
   9 项均因有意不发布的 PTX/采集清单夹具缺失而在读取时抛出 `FileNotFoundError`，
   没有代码断言失败。私有夹具不会为追求公开测试全绿而上传。

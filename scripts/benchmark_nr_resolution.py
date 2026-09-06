@@ -121,6 +121,8 @@ def exercise(a,phase):
             item['head_epilogue_launches_cumulative']=head_fused.add_launches if head_fused else 0
             item['head_qkv_launches_cumulative']=head_fused.qkv_launches if head_fused else 0
             item['matrix_launches_cumulative']=matrix.launches if matrix else 0
+            item['grouped_ffn_geometry_cumulative']=dict(matrix.grouped_ffn_geometry) if matrix else None
+            item['grouped_ffn_logical_dispatches_cumulative']=matrix.grouped_ffn_logical_dispatches if matrix else 0
             item['pre_features_launches_cumulative']=pre_fused.launches if pre_fused else 0
             item['pre_project_pack_launches_cumulative']=pre_fused.project_pack_launches if pre_fused else 0
             item['c32_layout_launches_cumulative']={'gather':c32_fused.gather_calls,'scatter':c32_fused.scatter_calls} if c32_fused else None

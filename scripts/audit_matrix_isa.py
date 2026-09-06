@@ -20,18 +20,26 @@ FAMILIES = {
     'c32_pv': 'c32_pv_wmma',
     'c32_output': 'c32_project_wmma',
     'c64_ffn': 'wide_ffn_wmmaILi64E',
+    'c64_group_ffn': 'wide_group_ffn_wmmaILi64E',
+    'c64_group_ffn_fp8w': 'wide_group_ffn_fp8wILi64E',
     'c128_ffn': 'wide_ffn_wmmaILi128E',
+    'c128_group_ffn': 'wide_group_ffn_wmmaILi128E',
+    'c128_group_ffn_fp8w': 'wide_group_ffn_fp8wILi128E',
     'c64_qkv': 'wide_qkv_wmmaILi64E',
     'c64_qk': 'wide_qk_wmmaILi64E',
     'c64_pv': 'wide_pv_wmmaILi64E',
     'c64_output': 'wide_project_wmmaILi64E',
     'c64_attention_bounded': 'wide_attention_head_fusedILi64E',
+    'c64_attention_query': 'wide_attention_query_fusedILi64E',
     'c128_qkv': 'wide_qkv_wmmaILi128E',
     'c128_qk': 'wide_qk_wmmaILi128E',
     'c128_pv': 'wide_pv_wmmaILi128E',
     'c128_output': 'wide_project_wmmaILi128E',
     'c128_attention_bounded': 'wide_attention_head_fusedILi128E',
+    'c128_attention_query': 'wide_attention_query_fusedILi128E',
     'c256_ffn': 'wide_ffn_wmmaILi256E',
+    'c256_group_ffn': 'wide_group_ffn_wmmaILi256E',
+    'c256_group_ffn_fp8w': 'wide_group_ffn_fp8wILi256E',
     'c512_group_ffn': 'c512_group_ffn_wmma',
 }
 
@@ -80,6 +88,7 @@ if __name__ == '__main__':
                 waves=next((value for value in reversed(values) if value in (1,2,4)),None)
                 if ('head_attention_window_fused' in row['symbol'] or 'wide_attention_head_fused' in row['symbol']
                         or 'c32_qkv_norm_staged' in row['symbol'] or 'c32_attention_core_staged' in row['symbol']):waves=4
+                if 'wide_group_ffn_wmma' in row['symbol'] or 'wide_group_ffn_fp8w' in row['symbol'] or 'wide_attention_query_fused' in row['symbol']:waves=1
                 allocated=((row['vgpr']+gran-1)//gran)*gran
                 vgpr_waves=min(max_waves,capacity//allocated)
                 if row['lds_bytes']:
