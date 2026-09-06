@@ -4,6 +4,9 @@
 C64/C128、C256/C512 的有界候选和收益判断；ViT 按计划只保留既有基准。
 所有路径默认关闭，未部署游戏，也不代表 RTX 画质或 4K60。
 
+后续 whole-grid、RGP、bounded attention 和低 LDS 重构进展统一汇总在
+[`PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md`](PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md)。
+
 ## 最终结论
 
 最终建议的显式实验配置为：
@@ -63,8 +66,10 @@ C512-only 的 4K A-B-B-A 使用 Head+C32 作为 A，B 只增加 C512 分组 MLP�
 - 最新 ISA 审计逐个候选函数确认实际包含 gfx1201 FP16/FP8 WMMA。所有候选 scratch=0；
   代表最大资源：C64 165 VGPR/32 KiB LDS，C128 132 VGPR/64 KiB LDS，
   C256 132 VGPR/64 KiB LDS，C512 69 VGPR/32 KiB LDS。
-- 纯 GPU activity、DRAM 流量和 kernel busy 总和仍不可用；本文没有用 event span 或
-  host 时间冒充这些指标。
+- 本文完成时纯 GPU activity/DRAM 证据尚不可用。后续仅对 Output Head 成功取得一组
+  完整、握手式 RGP SPM A/B；数据与限制见 `RDNA4_NATIVE_ENGINE_REFACTOR.md`。再后续的
+  两次 Pre 模块 counter capture 触发 `LiveKernelEvent 141`，已按安全门槛停止，不能把
+  不完整目录或 host/event 时间补作其它模块的 kernel-busy 数据。
 
 关键证据目录：
 
@@ -87,10 +92,10 @@ HIP ABI 使用调用方当前 stream、GPU输入和显式输出；不做CPU读�
 TDR 修改或 CPU 神经算子回退。当前结果只关闭本轮“候选实现和有界收益验证”计划，不关闭
 原生整帧画质、SDR/HDR、真实游戏上屏、稳定性和 4K60 里程碑。
 
-本地完整环境 CPU 回归 `843 passed in 66.22s`；公开快照本轮相关测试 `28 passed`，
-全套 `834 passed, 9 failed`，9 项均为未发布 PTX/采集夹具的 `FileNotFoundError`，没有
-代码断言失败。Python 编译检查和 `git diff --check` 通过（仅既有 LF/CRLF 提示）。
-原 arena SHA256 仍为
+最新本地完整环境 CPU 回归 `849 passed in 54.02s`；此前公开快照本轮相关测试
+`28 passed`，当时全套 `834 passed, 9 failed`，9项均为未发布PTX/采集夹具的
+`FileNotFoundError`，没有代码断言失败。Python编译检查和`git diff --check`通过
+（仅既有LF/CRLF提示）。原 arena SHA256 仍为
 `A5513B1845C98A486985ED04F38E66A1854CCE33C2ABA3A505866028BD4EE3E5`；最终选择配置的
 4K 输出仍为 `46F357EC1DA510A7CB7BC6D141E8A83DBA4DAD24179D72DC18BD150CD573056F`。
 审计时游戏未运行，也没有遗留本项目 GPU 验证进程。

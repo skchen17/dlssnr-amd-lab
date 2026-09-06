@@ -102,12 +102,21 @@ class RecoveredSingleColorPreblock(nn.Module):
     def forward(self,color,padded_width,padded_height,frame_seed,*,color_scale,conditioning,window_batch=12):
         if window_batch<=0 or padded_width%8 or padded_height%8 or color.device!=self.input_project.device:
             raise ValueError('same-device input, eight-aligned geometry and positive batch required')
-        features=single_color_features(color,padded_width,padded_height,frame_seed,
-                                       color_scale=color_scale,conditioning=conditioning)
-        # This original initial projection is FP16, not the FP8 policy used by FFNs.
-        projected=project_input_features(features,self.input_project)
-        windows,mapping=gather_packed(pack_image(projected),padded_width,padded_height,32,0,0)
-        values=torch.cat([self.swin(batch) for batch in windows.split(window_batch)])
+        from native_pre_fusion import active_pre_fusion
+        fusion=active_pre_fusion()
+        if fusion is not None and fusion.project_pack_enabled:
+            noise=positional_noise(padded_width,padded_height,frame_seed,color.device)
+            packed_input=fusion.project_pack(color,noise,self.input_project,padded_width,padded_height,
+                                             color_scale,conditioning)
+        else:
+            features=single_color_features(color,padded_width,padded_height,frame_seed,
+                                           color_scale=color_scale,conditioning=conditioning)
+            # This original initial projection is FP16, not the FP8 policy used by FFNs.
+            projected=project_input_features(features,self.input_project)
+            packed_input=pack_image(projected)
+        windows,mapping=gather_packed(packed_input,padded_width,padded_height,32,0,0)
+        from native_grid_policy import run_windows
+        values=run_windows(self.swin,windows,window_batch,'pre')
         packed=scatter_packed(values,mapping,padded_width,padded_height)
         pooled=average_pool2x2(unpack_image(packed,padded_width,padded_height,32))
         return {'skip':quantize_e4(packed),'outview':quantize_e4(pack_outview(pooled))}

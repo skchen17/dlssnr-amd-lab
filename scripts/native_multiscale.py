@@ -98,7 +98,8 @@ class RecoveredOutviewSwin(nn.Module):
             raise ValueError('positive window batch and decoded FP16 source required')
         packed = pack_image(unpack_outview(source, width, height, self.channels))
         windows, mapping = gather_packed(packed, width, height, self.channels, ox, oy)
-        values = torch.cat([self.block(batch) for batch in windows.split(window_batch)])
+        from native_grid_policy import run_windows
+        values = run_windows(self.block, windows, window_batch, f'c{self.channels}')
         return quantize_e4(scatter_packed(values, mapping, width, height))
 
 
@@ -127,7 +128,8 @@ class RecoveredDownsampleSwin(nn.Module):
         if packed.device != self.pool_project.device or packed.dtype != torch.float16:
             raise ValueError('decoded FP16 features must share the model device')
         windows, mapping = gather_packed(packed, width, height, self.channels, ox, oy)
-        projected = torch.cat([self.block(part) for part in windows.split(window_batch)])
+        from native_grid_policy import run_windows
+        projected = run_windows(self.block, windows, window_batch, f'c{self.channels}')
         unquantized = scatter_packed(projected, mapping, width, height)
         pooled = average_pool2x2(unpack_image(unquantized, width, height, self.channels))
         down = quantize_e4(chunked_linear(pooled[..., self.permutation], self.pool_project))

@@ -11,7 +11,8 @@ _active=ContextVar('native_matrix_fusion',default=None)
 
 def validate_config(profile,modules,waves):
     if profile not in PROFILES or waves not in (1,2,4):raise ValueError('unreviewed WMMA profile/wave count')
-    if not modules or set(modules)-{'head_ffn','head_attention','head_softmax','head_output','pre_input','c32_ffn','c32_attention','c64_ffn','c64_attention','c128_ffn','c128_attention','c256_ffn','c512_ffn'}:raise ValueError('module does not yet have an implemented WMMA path')
+    if not modules or set(modules)-{'head_ffn','head_attention','head_attention_bounded','head_softmax','head_output','pre_input','c32_ffn','c32_attention','c32_attention_bounded','c32_attention_staged','c32_attention_core','c64_ffn','c64_attention','c64_attention_bounded','c128_ffn','c128_attention','c128_attention_bounded','c256_ffn','c512_ffn'}:raise ValueError('module does not yet have an implemented WMMA path')
+    if len({'c32_attention_bounded','c32_attention_staged','c32_attention_core'}&set(modules))>1:raise ValueError('select exactly one C32 fused attention strategy')
 
 
 class MatrixFusion:
@@ -40,6 +41,11 @@ class MatrixFusion:
         self.softmax_launch=self.library.nr_head_softmax_e4
         self.softmax_launch.argtypes=[ct.c_void_p]*2+[ct.c_uint64,ct.c_void_p]
         self.softmax_launch.restype=ct.c_int
+        self.bounded_attention_launch=None
+        if 'head_attention_bounded' in self.modules:
+            self.bounded_attention_launch=self.library.nr_head_attention_window_fused
+            self.bounded_attention_launch.argtypes=[ct.c_void_p]*8+[ct.c_int]*2+[ct.c_void_p]
+            self.bounded_attention_launch.restype=ct.c_int
         self.pre_launch=self.library.nr_pre_project_exact
         self.pre_launch.argtypes=[ct.c_void_p]*3+[ct.c_uint64,ct.c_void_p]
         self.pre_launch.restype=ct.c_int
@@ -50,6 +56,20 @@ class MatrixFusion:
         self.c32_qk_launch=self.library.nr_c32_qk_wmma;self.c32_qk_launch.argtypes=[ct.c_void_p]*4+[ct.c_int]*3+[ct.c_void_p];self.c32_qk_launch.restype=ct.c_int
         self.c32_pv_launch=self.library.nr_c32_pv_wmma;self.c32_pv_launch.argtypes=[ct.c_void_p]*3+[ct.c_int]*3+[ct.c_void_p];self.c32_pv_launch.restype=ct.c_int
         self.c32_project_launch=self.library.nr_c32_project_wmma;self.c32_project_launch.argtypes=[ct.c_void_p]*6+[ct.c_int]*3+[ct.c_void_p];self.c32_project_launch.restype=ct.c_int
+        self.c32_bounded_attention_launch=None
+        if 'c32_attention_bounded' in self.modules:
+            self.c32_bounded_attention_launch=self.library.nr_c32_attention_window_fused
+            self.c32_bounded_attention_launch.argtypes=[ct.c_void_p]*8+[ct.c_int]*2+[ct.c_void_p]
+            self.c32_bounded_attention_launch.restype=ct.c_int
+        self.c32_staged_launch=None;self.c32_attention_core_launch=None
+        if {'c32_attention_staged','c32_attention_core'}&self.modules:
+            core=self.library.nr_c32_attention_core_staged
+            core.argtypes=[ct.c_void_p]*5+[ct.c_int]*2+[ct.c_void_p];core.restype=ct.c_int
+            self.c32_attention_core_launch=core
+        if 'c32_attention_staged' in self.modules:
+            qkv=self.library.nr_c32_qkv_norm_staged
+            qkv.argtypes=[ct.c_void_p]*7+[ct.c_int]*2+[ct.c_void_p];qkv.restype=ct.c_int
+            self.c32_staged_launch=(qkv,self.c32_attention_core_launch)
         self.wide_launch={}
         for channels in (64,128,256):
             fn=getattr(self.library,f'nr_c{channels}_ffn_wmma');fn.argtypes=[ct.c_void_p]*9+[ct.c_int]*3+[ct.c_void_p];fn.restype=ct.c_int;self.wide_launch[channels]=fn
@@ -61,8 +81,15 @@ class MatrixFusion:
                 fn.argtypes=[ct.c_void_p]*pointers+([ct.c_uint64,ct.c_void_p] if suffix=='qkv_norm' else [ct.c_int]*3+[ct.c_void_p])
                 fn.restype=ct.c_int;functions.append(fn)
             self.wide_attention_launch[channels]=tuple(functions)
+        self.wide_bounded_attention_launch={}
+        for channels in (64,128):
+            name=f'c{channels}_attention_bounded'
+            if name in self.modules:
+                fn=getattr(self.library,f'nr_c{channels}_attention_head_fused')
+                fn.argtypes=[ct.c_void_p]*6+[ct.c_int]*2+[ct.c_void_p];fn.restype=ct.c_int
+                self.wide_bounded_attention_launch[channels]=fn
         self.c512_launch=self.library.nr_c512_group_ffn_wmma;self.c512_launch.argtypes=[ct.c_void_p]*6+[ct.c_int]*3+[ct.c_void_p];self.c512_launch.restype=ct.c_int
-        self.cache=weakref.WeakKeyDictionary();self.c32_cache=weakref.WeakKeyDictionary();self.c32_attention_cache=weakref.WeakKeyDictionary();self.c512_cache=weakref.WeakKeyDictionary();self.c32_workspace={};self.wide_attention_workspace={};self.launches=0
+        self.cache=weakref.WeakKeyDictionary();self.c32_cache=weakref.WeakKeyDictionary();self.c32_attention_cache=weakref.WeakKeyDictionary();self.c512_cache=weakref.WeakKeyDictionary();self.c32_workspace={};self.c32_staged_workspace={};self.c32_core_workspace={};self.wide_attention_workspace={};self.wide_bounded_workspace={};self.launches=0
 
     def prepare(self,module):
         import torch
@@ -195,6 +222,25 @@ class MatrixFusion:
         if code:raise RuntimeError(f'Head softmax launch failed {code}; no fallback/retry')
         self.launches+=1;return out
 
+    def head_attention_bounded(self,module,first,out=None):
+        import torch
+        if self.bounded_attention_launch is None:raise ValueError('bounded Head attention was not enabled')
+        if first.ndim!=3 or first.shape[1:]!=(64,32) or first.dtype!=torch.float16 or first.requires_grad:
+            raise ValueError('bounded Head attention needs inference FP16 [windows,64,32]')
+        qkv_weight,project_weight=self.prepare(module)[3],self.prepare(module)[2]
+        tensors=(first,qkv_weight,module.q_scale,module.position_bias,project_weight,
+                 module.attention_scale,module.permutation)
+        if not torch.version.hip or any(not t.is_cuda or t.device!=first.device or not t.is_contiguous() for t in tensors):
+            raise ValueError('bounded Head attention needs contiguous same-device HIP tensors')
+        with torch.cuda.device(first.device):
+            if out is None:out=torch.empty_like(first)
+            if out.shape!=first.shape or out.dtype!=first.dtype or out.device!=first.device or not out.is_contiguous() or out.requires_grad:
+                raise ValueError('bounded Head attention caller output mismatch')
+            code=self.bounded_attention_launch(*(t.data_ptr() for t in tensors),out.data_ptr(),len(first),
+                int(self.profile=='wmma_fp8'),torch.cuda.current_stream(first.device).cuda_stream)
+        if code:raise RuntimeError(f'bounded Head attention launch failed {code}; no fallback/retry')
+        self.launches+=1;return out
+
     def pre_project(self,features,weight,out=None):
         import torch
         if self.profile!='wmma_fp16':raise ValueError('Pre input projection has no reviewed FP8 contract')
@@ -260,6 +306,100 @@ class MatrixFusion:
         if code:raise RuntimeError(f'C32 output projection failed {code}')
         self.launches+=6;return output
 
+    def c32_attention_bounded(self,module,post,out=None):
+        import torch
+        if self.c32_bounded_attention_launch is None:raise ValueError('bounded C32 attention is not enabled')
+        if module.channels!=32 or post.ndim!=3 or post.shape[1:]!=(64,32) or post.dtype!=torch.float16 or post.requires_grad:
+            raise ValueError('bounded C32 attention input mismatch')
+        params=(module.qkv,module.project);identity=tuple((id(p),p.data_ptr(),p._version,p.device,p.dtype) for p in params)
+        old=self.c32_attention_cache.get(module)
+        if old is None or old[0]!=identity:
+            from native_swin_torch import quantize_e4
+            self.c32_attention_cache[module]=(identity,tuple(quantize_e4(p).contiguous() for p in params))
+        qkv_weight,project_weight=self.c32_attention_cache[module][1]
+        tensors=(post,qkv_weight,module.q_scale,module.position_bias,project_weight,module.attention_scale,module.permutation)
+        if not torch.version.hip or any(not t.is_cuda or t.device!=post.device or not t.is_contiguous() for t in tensors):
+            raise ValueError('bounded C32 attention needs contiguous same-device HIP tensors')
+        with torch.cuda.device(post.device):
+            if out is None:out=torch.empty_like(post)
+            if out.shape!=post.shape or out.dtype!=post.dtype or out.device!=post.device or not out.is_contiguous() or out.requires_grad:
+                raise ValueError('bounded C32 attention caller output mismatch')
+            code=self.c32_bounded_attention_launch(*(t.data_ptr() for t in tensors),out.data_ptr(),len(post),
+                int(self.profile=='wmma_fp8'),torch.cuda.current_stream(post.device).cuda_stream)
+        if code:raise RuntimeError(f'bounded C32 attention launch failed {code}; no fallback/retry')
+        self.launches+=1;return out
+
+    def c32_attention_staged(self,module,post,out=None):
+        import torch
+        if self.c32_staged_launch is None:raise ValueError('staged C32 attention is not enabled')
+        if module.channels!=32 or post.ndim!=3 or post.shape[1:]!=(64,32) or post.dtype!=torch.float16 or post.requires_grad:
+            raise ValueError('staged C32 attention input mismatch')
+        params=(module.qkv,module.project);identity=tuple((id(p),p.data_ptr(),p._version,p.device,p.dtype) for p in params)
+        old=self.c32_attention_cache.get(module)
+        if old is None or old[0]!=identity:
+            from native_swin_torch import quantize_e4
+            self.c32_attention_cache[module]=(identity,tuple(quantize_e4(p).contiguous() for p in params))
+        qkv_weight,project_weight=self.c32_attention_cache[module][1]
+        tensors=(post,qkv_weight,project_weight,module.permutation,module.q_scale,module.position_bias,module.attention_scale)
+        if not torch.version.hip or any(not t.is_cuda or t.device!=post.device or not t.is_contiguous() for t in tensors):
+            raise ValueError('staged C32 attention needs contiguous same-device HIP tensors')
+        windows=len(post);stream=torch.cuda.current_stream(post.device).cuda_stream;fp8=int(self.profile=='wmma_fp8')
+        with torch.cuda.device(post.device):
+            key=(post.device,post.dtype,windows);workspace=self.c32_staged_workspace.get(key)
+            if workspace is None:
+                workspace=tuple(torch.empty_like(post) for _ in range(4))
+                self.c32_staged_workspace[key]=workspace
+            q,k,v,value=workspace
+            qkv_launch,core_launch=self.c32_staged_launch
+            code=qkv_launch(post.data_ptr(),qkv_weight.data_ptr(),module.q_scale.data_ptr(),module.permutation.data_ptr(),
+                q.data_ptr(),k.data_ptr(),v.data_ptr(),windows,fp8,stream)
+            if code:raise RuntimeError(f'staged C32 QKV/norm launch failed {code}')
+            code=core_launch(q.data_ptr(),k.data_ptr(),v.data_ptr(),module.position_bias.data_ptr(),value.data_ptr(),windows,fp8,stream)
+            if code:raise RuntimeError(f'staged C32 attention core launch failed {code}')
+            if out is None:out=torch.empty_like(post)
+            if out.shape!=post.shape or out.dtype!=post.dtype or out.device!=post.device or not out.is_contiguous() or out.requires_grad:
+                raise ValueError('staged C32 attention caller output mismatch')
+            code=self.c32_project_launch(post.data_ptr(),value.data_ptr(),project_weight.data_ptr(),module.attention_scale.data_ptr(),
+                module.permutation.data_ptr(),out.data_ptr(),windows,self.waves,fp8,stream)
+        if code:raise RuntimeError(f'staged C32 projection launch failed {code}')
+        self.launches+=3;return out
+
+    def c32_attention_core(self,module,post,out=None):
+        import torch
+        if self.c32_attention_core_launch is None:raise ValueError('core-fused C32 attention is not enabled')
+        if module.channels!=32 or post.ndim!=3 or post.shape[1:]!=(64,32) or post.dtype!=torch.float16 or post.requires_grad:
+            raise ValueError('core-fused C32 attention input mismatch')
+        params=(module.qkv,module.project);identity=tuple((id(p),p.data_ptr(),p._version,p.device,p.dtype) for p in params)
+        old=self.c32_attention_cache.get(module)
+        if old is None or old[0]!=identity:
+            from native_swin_torch import quantize_e4
+            self.c32_attention_cache[module]=(identity,tuple(quantize_e4(p).contiguous() for p in params))
+        qkv_weight,project_weight=self.c32_attention_cache[module][1]
+        tensors=(post,qkv_weight,project_weight,module.permutation,module.q_scale,module.position_bias,module.attention_scale)
+        if not torch.version.hip or any(not t.is_cuda or t.device!=post.device or not t.is_contiguous() for t in tensors):
+            raise ValueError('core-fused C32 attention needs contiguous same-device HIP tensors')
+        windows=len(post);rows=windows*64;stream=torch.cuda.current_stream(post.device).cuda_stream;fp8=int(self.profile=='wmma_fp8')
+        with torch.cuda.device(post.device):
+            key=(post.device,post.dtype,windows);workspace=self.c32_core_workspace.get(key)
+            if workspace is None:
+                workspace=(torch.empty((windows,64,96),dtype=post.dtype,device=post.device),
+                    *(torch.empty_like(post) for _ in range(4)))
+                self.c32_core_workspace[key]=workspace
+            projection,q,k,v,value=workspace
+            code=self.qkv_launch(post.data_ptr(),qkv_weight.data_ptr(),module.permutation.data_ptr(),projection.data_ptr(),windows,self.waves,fp8,stream)
+            if code:raise RuntimeError(f'core-fused C32 QKV projection failed {code}')
+            code=self.c32_norm_launch(projection.data_ptr(),module.q_scale.data_ptr(),q.data_ptr(),k.data_ptr(),v.data_ptr(),rows,stream)
+            if code:raise RuntimeError(f'core-fused C32 QKV norm failed {code}')
+            code=self.c32_attention_core_launch(q.data_ptr(),k.data_ptr(),v.data_ptr(),module.position_bias.data_ptr(),value.data_ptr(),windows,fp8,stream)
+            if code:raise RuntimeError(f'core-fused C32 attention core failed {code}')
+            if out is None:out=torch.empty_like(post)
+            if out.shape!=post.shape or out.dtype!=post.dtype or out.device!=post.device or not out.is_contiguous() or out.requires_grad:
+                raise ValueError('core-fused C32 attention caller output mismatch')
+            code=self.c32_project_launch(post.data_ptr(),value.data_ptr(),project_weight.data_ptr(),module.attention_scale.data_ptr(),
+                module.permutation.data_ptr(),out.data_ptr(),windows,self.waves,fp8,stream)
+        if code:raise RuntimeError(f'core-fused C32 projection failed {code}')
+        self.launches+=4;return out
+
     def wide_ffn(self,module,raw,out=None):
         import torch
         c=module.channels
@@ -317,6 +457,38 @@ class MatrixFusion:
             output=torch.empty_like(post);code=project(post.data_ptr(),value.data_ptr(),project_weight.data_ptr(),module.attention_scale.data_ptr(),module.permutation.data_ptr(),output.data_ptr(),windows,self.waves,fp8,stream)
         if code:raise RuntimeError(f'C{c} output projection failed {code}')
         self.launches+=6;return output
+
+    def wide_attention_bounded(self,module,post,out=None):
+        import torch
+        c=module.channels
+        if c not in self.wide_bounded_attention_launch or post.ndim!=3 or post.shape[1:]!=(64,c) or post.dtype!=torch.float16 or post.requires_grad:
+            raise ValueError('bounded wide attention input/module mismatch')
+        params=(module.qkv,module.project);identity=tuple((id(p),p.data_ptr(),p._version,p.device,p.dtype) for p in params)
+        old=self.c32_attention_cache.get(module)
+        if old is None or old[0]!=identity:
+            from native_swin_torch import quantize_e4
+            self.c32_attention_cache[module]=(identity,tuple(quantize_e4(p).contiguous() for p in params))
+        qkv_weight,project_weight=self.c32_attention_cache[module][1]
+        tensors=(post,qkv_weight,project_weight,module.permutation,module.q_scale,module.position_bias,module.attention_scale)
+        if not torch.version.hip or any(not t.is_cuda or t.device!=post.device or not t.is_contiguous() for t in tensors):
+            raise ValueError('bounded wide attention needs contiguous same-device HIP tensors')
+        windows=len(post);heads=c//32;stream=torch.cuda.current_stream(post.device).cuda_stream;fp8=int(self.profile=='wmma_fp8')
+        with torch.cuda.device(post.device):
+            key=(post.device,post.dtype,c,windows);value=self.wide_bounded_workspace.get(key)
+            if value is None:
+                value=torch.empty((windows,heads,64,32),dtype=post.dtype,device=post.device)
+                self.wide_bounded_workspace[key]=value
+            code=self.wide_bounded_attention_launch[c](post.data_ptr(),qkv_weight.data_ptr(),module.q_scale.data_ptr(),
+                module.position_bias.data_ptr(),module.permutation.data_ptr(),value.data_ptr(),windows,fp8,stream)
+            if code:raise RuntimeError(f'bounded C{c} attention-head launch failed {code}')
+            if out is None:out=torch.empty_like(post)
+            if out.shape!=post.shape or out.dtype!=post.dtype or out.device!=post.device or not out.is_contiguous() or out.requires_grad:
+                raise ValueError('bounded wide attention output mismatch')
+            project=self.wide_attention_launch[c][-1]
+            code=project(post.data_ptr(),value.data_ptr(),project_weight.data_ptr(),module.attention_scale.data_ptr(),
+                module.permutation.data_ptr(),out.data_ptr(),windows,self.waves,fp8,stream)
+        if code:raise RuntimeError(f'bounded C{c} output projection failed {code}')
+        self.launches+=2;return out
 
     def c512_group_ffn(self,module,projected,out=None):
         import torch

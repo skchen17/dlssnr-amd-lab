@@ -8,7 +8,7 @@ _active=ContextVar('head_input_fusion',default=None)
 def active_head_fusion():return _active.get()
 
 class HeadInput:
-    def __init__(self,dll,*,gather=False,epilogue=False,qkv=False):
+    def __init__(self,dll,*,gather=False,epilogue=False,qkv=False,whole_grid=False):
         self.library=ct.CDLL(str(Path(dll).resolve()))
         self.launch=self.library.native_fusion_head_input
         self.launch.argtypes=[ct.c_void_p]*5+[ct.c_int]*4+[ct.c_void_p]
@@ -26,6 +26,11 @@ class HeadInput:
         self.enable_gather=gather
         self.enable_epilogue=epilogue;self.epilogue_active=False;self.add_launches=0
         self.enable_qkv=qkv;self.qkv_active=False;self.qkv_launches=0
+        # Scheduling opt-in only.  The HIP input kernel already accepts the
+        # complete CTA range, but the historical caller split that range in
+        # Python and concatenated the results.  Keeping this separate from the
+        # math toggles makes A/B rollback and graph audits unambiguous.
+        self.whole_grid=bool(whole_grid)
         if qkv:
             self.qkv_launch=self.library.native_fusion_head_qkv
             self.qkv_launch.argtypes=[ct.c_void_p]*5+[ct.c_uint64,ct.c_void_p];self.qkv_launch.restype=ct.c_int
@@ -122,8 +127,8 @@ class HeadInput:
         return out
 
 @contextmanager
-def head_input_fusion(dll=None,*,gather=False,epilogue=False,qkv=False):
-    op=None if dll is None else HeadInput(dll,gather=gather,epilogue=epilogue,qkv=qkv)
+def head_input_fusion(dll=None,*,gather=False,epilogue=False,qkv=False,whole_grid=False):
+    op=None if dll is None else HeadInput(dll,gather=gather,epilogue=epilogue,qkv=qkv,whole_grid=whole_grid)
     token=_active.set(op)
     try:yield op
     finally:_active.reset(token)

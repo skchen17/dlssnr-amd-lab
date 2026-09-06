@@ -179,6 +179,48 @@ extern "C" __declspec(dllexport) int native_fusion_pre_features(const void* colo
     return int(hipGetLastError());
 }
 
+// Build the authored 16-channel input vector, perform the FP16 16x32
+// projection, and write the final packed C32 cell layout in one pass. Noise is
+// still supplied by the validated generator, so this changes neither its hash
+// nor its special-function semantics.
+__global__ static void pre_project_pack_kernel(const __half* color,const __half* noise,
+    const __half* constants,const __half* weight,__half* packed,int width,int height,int pw,size_t pixels,float scale) {
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=pixels*32)return;
+    size_t pixel=i/32;int channel=i%32,x=int(pixel%pw),y=int(pixel/pw);
+    int rx=width==1?0:x%(2*width-2),ry=height==1?0:y%(2*height-2);
+    rx=rx<width?rx:2*width-2-rx;ry=ry<height?ry:2*height-2-ry;
+    float sum=0.f;
+    for(int k=0;k<16;++k) {
+        __half feature;
+        if(k<3)feature=noise[pixel*3+k];
+        else if(k==3)feature=__float2half_rn(1.f);
+        else if(k<10) {
+            float source=__half2float(color[(size_t(ry)*width+rx)*4+(k-4)%3]);
+            float centered=__half2float(__float2half_rn(source-.5f));
+            feature=__float2half_rn(centered*scale);
+        } else if(k<15)feature=constants[k-10];
+        else feature=__float2half_rn(0.f);
+        sum+=__half2float(feature)*__half2float(weight[k*32+channel]);
+    }
+    int token=(y%4)*4+x%4,row=token%16,col=channel%32;
+    int mma=col/16*2+(col%16)/8,pairs[8]={0,2,1,3,4,6,5,7};
+    int element=(row>=8)*2+(col&1),operation=pairs[mma*2+element/2];
+    int local=(row%8*4+col%8/2)*16+operation*2+(element&1);
+    size_t cell=(size_t(y/4)*(pw/4)+x/4)*512;
+    packed[cell+local]=__float2half_rn(sum);
+}
+extern "C" __declspec(dllexport) int native_fusion_pre_project_pack(const void* color,const void* noise,
+    const void* constants,const void* weight,void* packed,int width,int height,int pw,int ph,float scale,void* stream) {
+    if(!color||!noise||!constants||!weight||!packed||width<=0||height<=0||pw<width||ph<height||pw%4||ph%4)
+        return int(hipErrorInvalidValue);
+    size_t pixels=size_t(pw)*ph;
+    hipLaunchKernelGGL(pre_project_pack_kernel,dim3(unsigned((pixels*32+255)/256)),dim3(256),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const __half*>(color),static_cast<const __half*>(noise),
+        static_cast<const __half*>(constants),static_cast<const __half*>(weight),static_cast<__half*>(packed),
+        width,height,pw,pixels,scale);
+    return int(hipGetLastError());
+}
+
 __global__ static void c32_gather_kernel(const uint16_t* input,uint16_t* out,int width,int height,int ox,int oy,size_t n) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=n)return;
     int cta=i/2048,cell=i%2048/512,local=i%512,gx=(width-ox+7)/8;

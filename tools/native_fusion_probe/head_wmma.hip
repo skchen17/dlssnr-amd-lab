@@ -216,6 +216,154 @@ __global__ void head_softmax_e4(const _Float16* scores,_Float16* probability,siz
     probability[row*64+lane+32]=quant(rnd(e1/sum));
 }
 
+// One workgroup owns one complete 8x8 Head window. Q/K/V and the 64x64
+// attention matrix stay in bounded LDS for their entire lifetime, so whole-grid
+// scheduling does not materialize full-frame projection, Q/K/V, score,
+// probability, or value tensors in VRAM. Four wave32s each own 16 rows.
+template<bool FP8,bool C32_RULES=false> __global__ void head_attention_window_fused(
+    const _Float16* first,const _Float16* qkv_weight,const _Float16* qscale,
+    const _Float16* position_bias,const _Float16* project_weight,
+    const _Float16* attention_scale,const int64_t* perm,_Float16* output,int windows) {
+    __shared__ _Float16 qkv[64*96];
+    __shared__ _Float16 scores[64*64];
+    int window=blockIdx.x,wave=threadIdx.x/32,lane=threadIdx.x%32;
+    int token=lane%16,group=lane/16,row=wave*16+token;
+    if(window>=windows)return;
+
+    // Quantized gather + 32x96 QKV projection, preserving the half store.
+    for(int m=0;m<6;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e;
+                a[e]=qkv_weight[kk*96+m*16+token];
+                b[e]=quant(first[(window*64+row)*32+perm[kk]]);
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)qkv[row*96+m*16+group*8+e]=rnd(acc[e]);
+    }
+    __syncthreads();
+
+    // Exact recovered half reduction tree. Each wave serially normalizes its
+    // sixteen rows while all 32 lanes cover one vector.
+    for(int local=0;local<16;++local) {
+        int norm_row=wave*16+local;
+        for(int part=0;part<3;++part) {
+            _Float16 h=qkv[norm_row*96+part*32+lane];
+            if(part==2) {
+                qkv[norm_row*96+64+lane]=quant(h);
+            } else {
+                float t=float(h),sum=float(rnd(t*t));
+                for(int offset=1;offset<32;offset*=2) {
+                    float other=__shfl_down(sum,offset,32);
+                    if((lane%(2*offset))==0)sum=float(rnd(sum+other));
+                }
+                sum=__shfl(sum,0,32);
+                float inv=float(rnd(rsqrtf(fmaxf(sum,6.198883056640625e-5f))));
+                _Float16 normalized=rnd(t*inv);
+                if(part==0)normalized=rnd(float(normalized)*float(*qscale));
+                qkv[norm_row*96+part*32+lane]=quant(normalized);
+            }
+        }
+    }
+    __syncthreads();
+
+    // QK and position bias; layout and WMMA accumulation match head_qk_wmma.
+    for(int kt=0;kt<4;++kt) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e,key=kt*16+token;
+                a[e]=qkv[key*96+32+kk];b[e]=qkv[row*96+kk];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int key=kt*16+group*8+e;
+            if constexpr(C32_RULES)scores[row*64+key]=rnd(float(rnd(acc[e]))+float(position_bias[row*64+key]));
+            else scores[row*64+key]=rnd(acc[e]+float(position_bias[row*64+key]));
+        }
+    }
+    __syncthreads();
+
+    // In-place E4M3 softmax. One wave handles sixteen complete query rows.
+    for(int local=0;local<16;++local) {
+        int query_row=wave*16+local;
+        float x0=float(scores[query_row*64+lane]),x1=float(scores[query_row*64+lane+32]);
+        float maximum=fmaxf(x0,x1);
+        for(int offset=16;offset;offset>>=1)maximum=fmaxf(maximum,__shfl_down(maximum,offset,32));
+        maximum=__shfl(maximum,0,32);
+        float e0=expf(x0-maximum),e1=expf(x1-maximum),sum=e0+e1;
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down(sum,offset,32);
+        sum=__shfl(sum,0,32);
+        scores[query_row*64+lane]=quant(rnd(e0/sum));
+        scores[query_row*64+lane+32]=quant(rnd(e1/sum));
+    }
+    __syncthreads();
+
+    // PV overwrites the now-dead Q region in qkv. Head keeps its explicit K=32
+    // half boundary; C32 native_fp16 uses one K64 accumulation.
+    for(int m=0;m<2;++m) {
+        if constexpr(C32_RULES) {
+            F8 acc={};
+            for(int chunk=0;chunk<4;++chunk) {
+                H8 a,b;
+                for(int e=0;e<8;++e) {
+                    int key=chunk*16+group*8+e,channel=m*16+token;
+                    a[e]=qkv[key*96+64+channel];b[e]=scores[row*64+key];
+                }
+                acc=mma<FP8>(a,b,acc);
+            }
+            for(int e=0;e<8;++e)qkv[row*96+m*16+group*8+e]=rnd(acc[e]);
+        } else {
+            F8 first_half={};
+            for(int chunk=0;chunk<2;++chunk) {
+                H8 a,b;
+                for(int e=0;e<8;++e) {
+                    int key=chunk*16+group*8+e,channel=m*16+token;
+                    a[e]=qkv[key*96+64+channel];b[e]=scores[row*64+key];
+                }
+                first_half=mma<FP8>(a,b,first_half);
+            }
+            H8 seed;for(int e=0;e<8;++e)seed[e]=rnd(first_half[e]);
+            F8 second_half={};
+            for(int chunk=2;chunk<4;++chunk) {
+                H8 a,b;
+                for(int e=0;e<8;++e) {
+                    int key=chunk*16+group*8+e,channel=m*16+token;
+                    a[e]=qkv[key*96+64+channel];b[e]=scores[row*64+key];
+                }
+                second_half=mma<FP8>(a,b,second_half);
+            }
+            for(int e=0;e<8;++e)qkv[row*96+m*16+group*8+e]=rnd(float(seed[e])+second_half[e]);
+        }
+    }
+    __syncthreads();
+
+    // Attention projection and scaled residual, preserving both half boundaries.
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e;
+                a[e]=project_weight[kk*32+m*16+token];
+                b[e]=quant(qkv[row*96+perm[kk]]);
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int channel=m*16+group*8+e;
+            _Float16 seed=rnd(float(first[(window*64+row)*32+channel])*float(attention_scale[channel]));
+            if constexpr(C32_RULES)output[(window*64+row)*32+channel]=rnd(float(seed)+float(rnd(acc[e])));
+            else output[(window*64+row)*32+channel]=rnd(float(seed)+acc[e]);
+        }
+    }
+}
+
 // Pre input projection is the model's original FP16 16x32 matrix, not an FP8
 // FFN boundary. One wave consumes 16 independent full-frame pixels.
 template<int WAVES> __global__ void pre_project_wmma(
@@ -344,6 +492,110 @@ template<int WAVES,bool FP8> __global__ void c32_project_wmma(const _Float16* po
     for(int m=0;m<2;++m){F8 acc={};for(int chunk=0;chunk<2;++chunk){H8 a,b;for(int e=0;e<8;++e){int kk=chunk*16+group*8+e;a[e]=weight[kk*32+m*16+token];b[e]=active?quant(value[(window*64+row)*32+perm[kk]]):0;}acc=mma<FP8>(a,b,acc);}if(active)for(int e=0;e<8;++e){int c=m*16+group*8+e;_Float16 seed=rnd(float(post[(window*64+row)*32+c])*float(scale[c]));output[(window*64+row)*32+c]=rnd(float(rnd(acc[e]))+float(seed));}}
 }
 
+// Three-stage C32 attention candidate. Stage one keeps only the transient
+// 64x96 projection in LDS, applies the recovered normalization tree, and emits
+// normalized Q/K/V. This removes the global unnormalized projection without
+// coupling its 12 KiB lifetime to the score matrix.
+template<bool FP8> __global__ void c32_qkv_norm_staged(
+    const _Float16* post,const _Float16* qkv_weight,const _Float16* qscale,
+    const int64_t* perm,_Float16* q,_Float16* k,_Float16* v,int windows) {
+    __shared__ _Float16 projection[64*96];
+    int window=blockIdx.x,wave=threadIdx.x/32,lane=threadIdx.x%32;
+    int token=lane%16,group=lane/16,row=wave*16+token;
+    if(window>=windows)return;
+    for(int m=0;m<6;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e;
+                a[e]=qkv_weight[kk*96+m*16+token];
+                b[e]=quant(post[(window*64+row)*32+perm[kk]]);
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)projection[row*96+m*16+group*8+e]=rnd(acc[e]);
+    }
+    __syncthreads();
+    for(int local=0;local<16;++local) {
+        int norm_row=wave*16+local;
+        for(int part=0;part<3;++part) {
+            _Float16 h=projection[norm_row*96+part*32+lane];
+            _Float16* destination=part==0?q:(part==1?k:v);
+            if(part==2) {
+                destination[(window*64+norm_row)*32+lane]=quant(h);
+            } else {
+                float t=float(h),sum=float(rnd(t*t));
+                for(int offset=1;offset<32;offset*=2) {
+                    float other=__shfl_down(sum,offset,32);
+                    if((lane%(2*offset))==0)sum=float(rnd(sum+other));
+                }
+                sum=__shfl(sum,0,32);
+                float inv=float(rnd(rsqrtf(fmaxf(sum,6.198883056640625e-5f))));
+                _Float16 normalized=rnd(t*inv);
+                if(part==0)normalized=rnd(float(normalized)*float(*qscale));
+                destination[(window*64+norm_row)*32+lane]=quant(normalized);
+            }
+        }
+    }
+}
+
+// Stage two retains only the 64x64 score/probability matrix (8 KiB) in LDS.
+// Q/K/V are read from the prior resident workspace, and only the 64x32 value
+// tensor is written. QK, E4M3 softmax and the single-K64 C32 PV boundaries are
+// intentionally identical to the established six-dispatch implementation.
+template<bool FP8> __global__ void c32_attention_core_staged(
+    const _Float16* q,const _Float16* k,const _Float16* v,
+    const _Float16* position_bias,_Float16* value,int windows) {
+    __shared__ _Float16 scores[64*64];
+    int window=blockIdx.x,wave=threadIdx.x/32,lane=threadIdx.x%32;
+    int query=lane%16,group=lane/16,row=wave*16+query;
+    if(window>=windows)return;
+    for(int kt=0;kt<4;++kt) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e,key=kt*16+query;
+                a[e]=k[(window*64+key)*32+kk];
+                b[e]=q[(window*64+row)*32+kk];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int key=kt*16+group*8+e;
+            scores[row*64+key]=rnd(float(rnd(acc[e]))+float(position_bias[row*64+key]));
+        }
+    }
+    __syncthreads();
+    for(int local=0;local<16;++local) {
+        int query_row=wave*16+local;
+        float x0=float(scores[query_row*64+lane]),x1=float(scores[query_row*64+lane+32]);
+        float maximum=fmaxf(x0,x1);
+        for(int offset=16;offset;offset>>=1)maximum=fmaxf(maximum,__shfl_down(maximum,offset,32));
+        maximum=__shfl(maximum,0,32);
+        float e0=expf(x0-maximum),e1=expf(x1-maximum),sum=e0+e1;
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down(sum,offset,32);
+        sum=__shfl(sum,0,32);
+        scores[query_row*64+lane]=quant(rnd(e0/sum));
+        scores[query_row*64+lane+32]=quant(rnd(e1/sum));
+    }
+    __syncthreads();
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<4;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int key=chunk*16+group*8+e,channel=m*16+query;
+                a[e]=v[(window*64+key)*32+channel];
+                b[e]=scores[row*64+key];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)value[(window*64+row)*32+m*16+group*8+e]=rnd(acc[e]);
+    }
+}
+
 template<int C,int WAVES,bool FP8> __global__ void wide_qkv_wmma(const _Float16* input,const _Float16* weight,const int64_t* perm,_Float16* projection,int windows) {
     int wave=threadIdx.x/32,lane=threadIdx.x%32,token=lane%16,group=lane/16;int tile=blockIdx.x*WAVES+wave,window=tile/4,row=tile%4*16+token;bool active=window<windows;
     for(int m=0;m<3*C/16;++m){F8 acc={};for(int chunk=0;chunk<C/16;++chunk){H8 a,b;for(int e=0;e<8;++e){int kk=chunk*16+group*8+e;a[e]=weight[kk*(3*C)+m*16+token];b[e]=active?quant(input[(window*64+row)*C+perm[kk]]):0;}acc=mma<FP8>(a,b,acc);}if(active)for(int e=0;e<8;++e)projection[(window*64+row)*(3*C)+m*16+group*8+e]=rnd(acc[e]);}
@@ -368,6 +620,98 @@ template<int C,int WAVES,bool FP8> __global__ void wide_pv_wmma(const _Float16* 
 template<int C,int WAVES,bool FP8> __global__ void wide_project_wmma(const _Float16* post,const _Float16* value,const _Float16* weight,const _Float16* scale,const int64_t* perm,_Float16* output,int windows) {
     int heads=C/32,wave=threadIdx.x/32,lane=threadIdx.x%32,token=lane%16,group=lane/16;int tile=blockIdx.x*WAVES+wave,window=tile/4,row=tile%4*16+token;bool active=window<windows;
     for(int m=0;m<C/16;++m){F8 acc={};for(int chunk=0;chunk<C/16;++chunk){H8 a,b;for(int e=0;e<8;++e){int kk=chunk*16+group*8+e,source=perm[kk],head=source/32,local=source%32;a[e]=weight[kk*C+m*16+token];b[e]=active?quant(value[((window*heads+head)*64+row)*32+local]):0;}acc=mma<FP8>(a,b,acc);}if(active)for(int e=0;e<8;++e){int c=m*16+group*8+e;_Float16 seed=rnd(float(post[(window*64+row)*C+c])*float(scale[c]));output[(window*64+row)*C+c]=rnd(float(rnd(acc[e]))+float(seed));}}
+}
+
+// Bounded wide-family attention. One workgroup owns one (window,head) pair;
+// Q/K/V and scores stay in 20 KiB LDS. Only the final per-head attention value
+// is written globally. A separate projection kernel performs the intentional
+// cross-head/channel mix, keeping the fusion boundary bounded for C64/C128.
+template<int C,bool FP8> __global__ void wide_attention_head_fused(
+    const _Float16* post,const _Float16* qkv_weight,const _Float16* qscale,
+    const _Float16* position_bias,const int64_t* perm,_Float16* value,int windows) {
+    __shared__ _Float16 qkv[64*96];
+    __shared__ _Float16 scores[64*64];
+    constexpr int HEADS=C/32;
+    int task=blockIdx.x,head=task%HEADS,window=task/HEADS;
+    int wave=threadIdx.x/32,lane=threadIdx.x%32,token=lane%16,group=lane/16,row=wave*16+token;
+    if(window>=windows)return;
+    for(int m=0;m<6;++m) {
+        int part=m/2,sub=m%2;F8 acc={};
+        for(int chunk=0;chunk<C/16;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e;
+                int out_col=part*C+head*32+sub*16+token;
+                a[e]=qkv_weight[kk*(3*C)+out_col];
+                b[e]=quant(post[(window*64+row)*C+perm[kk]]);
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)qkv[row*96+m*16+group*8+e]=rnd(acc[e]);
+    }
+    __syncthreads();
+    for(int local=0;local<16;++local) {
+        int norm_row=wave*16+local;
+        for(int part=0;part<3;++part) {
+            _Float16 h=qkv[norm_row*96+part*32+lane];
+            if(part==2)qkv[norm_row*96+64+lane]=quant(h);
+            else {
+                float t=float(h),sum=float(rnd(t*t));
+                for(int offset=1;offset<32;offset*=2) {
+                    float other=__shfl_down(sum,offset,32);
+                    if((lane%(2*offset))==0)sum=float(rnd(sum+other));
+                }
+                sum=__shfl(sum,0,32);
+                float inv=float(rnd(rsqrtf(fmaxf(sum,6.198883056640625e-5f))));
+                _Float16 normalized=rnd(t*inv);
+                if(part==0)normalized=rnd(float(normalized)*float(qscale[head]));
+                qkv[norm_row*96+part*32+lane]=quant(normalized);
+            }
+        }
+    }
+    __syncthreads();
+    for(int kt=0;kt<4;++kt) {
+        F8 acc={};
+        for(int chunk=0;chunk<2;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int kk=chunk*16+group*8+e,key=kt*16+token;
+                a[e]=qkv[key*96+32+kk];b[e]=qkv[row*96+kk];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e) {
+            int key=kt*16+group*8+e;
+            scores[row*64+key]=rnd(float(rnd(acc[e]))+float(position_bias[(head*64+row)*64+key]));
+        }
+    }
+    __syncthreads();
+    for(int local=0;local<16;++local) {
+        int query_row=wave*16+local;
+        float x0=float(scores[query_row*64+lane]),x1=float(scores[query_row*64+lane+32]);
+        float maximum=fmaxf(x0,x1);
+        for(int offset=16;offset;offset>>=1)maximum=fmaxf(maximum,__shfl_down(maximum,offset,32));
+        maximum=__shfl(maximum,0,32);
+        float e0=expf(x0-maximum),e1=expf(x1-maximum),sum=e0+e1;
+        for(int offset=16;offset;offset>>=1)sum+=__shfl_down(sum,offset,32);
+        sum=__shfl(sum,0,32);
+        scores[query_row*64+lane]=quant(rnd(e0/sum));
+        scores[query_row*64+lane+32]=quant(rnd(e1/sum));
+    }
+    __syncthreads();
+    size_t base=(size_t(window)*HEADS+head)*64;
+    for(int m=0;m<2;++m) {
+        F8 acc={};
+        for(int chunk=0;chunk<4;++chunk) {
+            H8 a,b;
+            for(int e=0;e<8;++e) {
+                int key=chunk*16+group*8+e,channel=m*16+token;
+                a[e]=qkv[key*96+64+channel];b[e]=scores[row*64+key];
+            }
+            acc=mma<FP8>(a,b,acc);
+        }
+        for(int e=0;e<8;++e)value[(base+row)*32+m*16+group*8+e]=rnd(acc[e]);
+    }
 }
 
 __global__ void pre_project_exact(const _Float16* input,const _Float16* weight,
@@ -450,6 +794,39 @@ extern "C" __declspec(dllexport) int nr_head_softmax_e4(
     return int(hipGetLastError());
 }
 
+extern "C" __declspec(dllexport) int nr_head_attention_window_fused(
+    const void* first,const void* qkv_weight,const void* qscale,const void* bias,
+    const void* project_weight,const void* attention_scale,const void* perm,void* output,
+    int windows,int fp8,void* stream) {
+    if(!first||!qkv_weight||!qscale||!bias||!project_weight||!attention_scale||!perm||!output||
+       windows<1||windows>262144||(fp8!=0&&fp8!=1))return int(hipErrorInvalidValue);
+#define ATTN(F) hipLaunchKernelGGL((head_attention_window_fused<F,false>),dim3(windows),dim3(128),0,reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(first),static_cast<const _Float16*>(qkv_weight),static_cast<const _Float16*>(qscale),static_cast<const _Float16*>(bias),static_cast<const _Float16*>(project_weight),static_cast<const _Float16*>(attention_scale),static_cast<const int64_t*>(perm),static_cast<_Float16*>(output),windows)
+    if(fp8){ATTN(true);}else{ATTN(false);}
+#undef ATTN
+    return int(hipGetLastError());
+}
+
+// The recovered C32 window-attention contract has the same logical tensor,
+// weight, scale, position-bias and half-rounding boundaries as Head attention.
+// Keep a distinct ABI symbol so policies and evidence cannot accidentally
+// promote one family based on the other's gate.
+extern "C" __declspec(dllexport) int nr_c32_attention_window_fused(
+    const void* first,const void* qkv_weight,const void* qscale,const void* bias,
+    const void* project_weight,const void* attention_scale,const void* perm,
+    void* output,int windows,int fp8,void* stream) {
+    if(!first||!qkv_weight||!qscale||!bias||!project_weight||!attention_scale||!perm||!output||
+       windows<1||(fp8!=0&&fp8!=1))return int(hipErrorInvalidValue);
+#define C32_ATTN(F) hipLaunchKernelGGL((head_attention_window_fused<F,true>),dim3(windows),dim3(128),0,\
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(first),\
+        static_cast<const _Float16*>(qkv_weight),static_cast<const _Float16*>(qscale),\
+        static_cast<const _Float16*>(bias),static_cast<const _Float16*>(project_weight),\
+        static_cast<const _Float16*>(attention_scale),static_cast<const int64_t*>(perm),\
+        static_cast<_Float16*>(output),windows)
+    if(fp8){C32_ATTN(true);}else{C32_ATTN(false);}
+#undef C32_ATTN
+    return int(hipGetLastError());
+}
+
 extern "C" __declspec(dllexport) int nr_pre_project_wmma(
     const void* input,const void* weight,void* output,uint64_t rows,int waves,void* stream) {
     if(!input||!weight||!output||!rows||rows>(uint64_t(1)<<32)||rows%16||(waves!=1&&waves!=2&&waves!=4))return int(hipErrorInvalidValue);
@@ -503,6 +880,35 @@ extern "C" __declspec(dllexport) int nr_c32_project_wmma(const void* post,const 
     return int(hipGetLastError());
 }
 
+extern "C" __declspec(dllexport) int nr_c32_qkv_norm_staged(
+    const void* post,const void* qkv_weight,const void* qscale,const void* perm,
+    void* q,void* k,void* v,int windows,int fp8,void* stream) {
+    if(!post||!qkv_weight||!qscale||!perm||!q||!k||!v||windows<1||windows>262144||
+       (fp8!=0&&fp8!=1))return int(hipErrorInvalidValue);
+#define C32_STAGED_QKV(F) hipLaunchKernelGGL((c32_qkv_norm_staged<F>),dim3(windows),dim3(128),0,\
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(post),\
+        static_cast<const _Float16*>(qkv_weight),static_cast<const _Float16*>(qscale),\
+        static_cast<const int64_t*>(perm),static_cast<_Float16*>(q),static_cast<_Float16*>(k),\
+        static_cast<_Float16*>(v),windows)
+    if(fp8){C32_STAGED_QKV(true);}else{C32_STAGED_QKV(false);}
+#undef C32_STAGED_QKV
+    return int(hipGetLastError());
+}
+
+extern "C" __declspec(dllexport) int nr_c32_attention_core_staged(
+    const void* q,const void* k,const void* v,const void* bias,void* value,
+    int windows,int fp8,void* stream) {
+    if(!q||!k||!v||!bias||!value||windows<1||windows>262144||
+       (fp8!=0&&fp8!=1))return int(hipErrorInvalidValue);
+#define C32_STAGED_CORE(F) hipLaunchKernelGGL((c32_attention_core_staged<F>),dim3(windows),dim3(128),0,\
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(q),\
+        static_cast<const _Float16*>(k),static_cast<const _Float16*>(v),\
+        static_cast<const _Float16*>(bias),static_cast<_Float16*>(value),windows)
+    if(fp8){C32_STAGED_CORE(true);}else{C32_STAGED_CORE(false);}
+#undef C32_STAGED_CORE
+    return int(hipGetLastError());
+}
+
 template<int C,int W,bool FP8> static void launch_wide_qkv(const void* input,const void* weight,const void* perm,void* output,int windows,void* stream){hipLaunchKernelGGL((wide_qkv_wmma<C,W,FP8>),dim3((windows*4+W-1)/W),dim3(W*32),0,reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(input),static_cast<const _Float16*>(weight),static_cast<const int64_t*>(perm),static_cast<_Float16*>(output),windows);}
 template<int C,int W,bool FP8> static void launch_wide_qk(const void* q,const void* k,const void* bias,void* output,int windows,void* stream){hipLaunchKernelGGL((wide_qk_wmma<C,W,FP8>),dim3((windows*4*(C/32)+W-1)/W),dim3(W*32),0,reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(q),static_cast<const _Float16*>(k),static_cast<const _Float16*>(bias),static_cast<_Float16*>(output),windows);}
 template<int C,int W,bool FP8> static void launch_wide_pv(const void* p,const void* v,void* output,int windows,void* stream){hipLaunchKernelGGL((wide_pv_wmma<C,W,FP8>),dim3((windows*4*(C/32)+W-1)/W),dim3(W*32),0,reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(p),static_cast<const _Float16*>(v),static_cast<_Float16*>(output),windows);}
@@ -524,6 +930,31 @@ extern "C" __declspec(dllexport) int nr_c##C##_project_wmma(const void* post,con
 WIDE_ATTN_EXPORT(64)
 WIDE_ATTN_EXPORT(128)
 #undef WIDE_ATTN_EXPORT
+
+template<int C,bool FP8> static void launch_wide_attention_head_fused(
+    const void* post,const void* qkv,const void* qscale,const void* bias,const void* perm,
+    void* value,int windows,void* stream) {
+    hipLaunchKernelGGL((wide_attention_head_fused<C,FP8>),dim3(windows*(C/32)),dim3(128),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const _Float16*>(post),
+        static_cast<const _Float16*>(qkv),static_cast<const _Float16*>(qscale),
+        static_cast<const _Float16*>(bias),static_cast<const int64_t*>(perm),
+        static_cast<_Float16*>(value),windows);
+}
+template<int C> static int wide_attention_head_entry(const void* post,const void* qkv,const void* qscale,
+    const void* bias,const void* perm,void* value,int windows,int fp8,void* stream) {
+    if(!post||!qkv||!qscale||!bias||!perm||!value||windows<1||(fp8!=0&&fp8!=1))return int(hipErrorInvalidValue);
+    if(fp8)launch_wide_attention_head_fused<C,true>(post,qkv,qscale,bias,perm,value,windows,stream);
+    else launch_wide_attention_head_fused<C,false>(post,qkv,qscale,bias,perm,value,windows,stream);
+    return int(hipGetLastError());
+}
+extern "C" __declspec(dllexport) int nr_c64_attention_head_fused(const void* post,const void* qkv,
+    const void* qscale,const void* bias,const void* perm,void* value,int windows,int fp8,void* stream) {
+    return wide_attention_head_entry<64>(post,qkv,qscale,bias,perm,value,windows,fp8,stream);
+}
+extern "C" __declspec(dllexport) int nr_c128_attention_head_fused(const void* post,const void* qkv,
+    const void* qscale,const void* bias,const void* perm,void* value,int windows,int fp8,void* stream) {
+    return wide_attention_head_entry<128>(post,qkv,qscale,bias,perm,value,windows,fp8,stream);
+}
 
 template<int C,int W,bool FP8> static void launch_wide(const void* raw,const void* expand,
     const void* contract,const void* mix,const void* scale,const void* ai,const void* ri,

@@ -55,7 +55,8 @@ class RecoveredDecoderPyramid(nn.Module):
                 value=model(value,skips[c],w,h,ox,oy,window_batch=window_batch)
             else:
                 windows,mapping=gather_packed(value,w,h,c,ox,oy)
-                logical=torch.cat([model(part) for part in windows.split(window_batch)])
+                from native_grid_policy import run_windows
+                logical=run_windows(model,windows,window_batch,f'c{c}')
                 packed=scatter_packed(logical,mapping,w,h)
                 value=pack_outview(unpack_image(packed,w,h,c)) if role=='outview' else packed
                 value=quantize_e4(value)

@@ -88,7 +88,8 @@ class SingleColorWholeFrame(nn.Module):
                     value=model(value,sw,sh,ox,oy,window_batch=window_batch)
                 else:
                     windows,mapping=gather_packed(value,sw,sh,c,ox,oy)
-                    value=quantize_e4(scatter_packed(torch.cat([model(p) for p in windows.split(window_batch)]),mapping,sw,sh))
+                    from native_grid_policy import run_windows
+                    value=quantize_e4(scatter_packed(run_windows(model,windows,window_batch,f'c{c}'),mapping,sw,sh))
                 if b==last:
                     skips[c]=value['skip']; value=value['captured_outview']
                 yield b,value
@@ -111,10 +112,20 @@ class SingleColorWholeFrame(nn.Module):
             yield b,value
         for b,value in self.decoder.stages(value,{c:skips[c] for c in (32,64,128,256)},pw//2,ph//2,window_batch=window_batch):
             yield b,value
-        ctas=torch.arange(((pw+11)//8)*((ph+11)//8),device=color.device)
+        cta_count=((pw+11)//8)*((ph+11)//8)
         from native_head_fusion import active_head_fusion
-        residual=torch.cat([self.head.forward_range(value,pre['skip'],start,min(boundary_batch,len(ctas)-start),pw,ph)
-                            for start in range(0,len(ctas),boundary_batch)]) if self.head.cache_layout_enabled or active_head_fusion() is not None else torch.cat(
+        fusion=active_head_fusion()
+        if fusion is not None and fusion.whole_grid:
+            # One full-grid input dispatch and one full-grid invocation of each
+            # following Head boundary.  No arange, split, Python batch loop or
+            # cat is present in this opt-in path.  Kernel fusion is evaluated
+            # independently; reducing host scheduling alone is not treated as
+            # a performance pass.
+            residual=self.head.forward_range(value,pre['skip'],0,cta_count,pw,ph)
+        else:
+            ctas=torch.arange(cta_count,device=color.device)
+            residual=torch.cat([self.head.forward_range(value,pre['skip'],start,min(boundary_batch,len(ctas)-start),pw,ph)
+                            for start in range(0,len(ctas),boundary_batch)]) if self.head.cache_layout_enabled or fusion is not None else torch.cat(
                                 [self.head(value,pre['skip'],batch,pw,ph) for batch in ctas.split(boundary_batch)])
         yield 70,compose_legacy_sdr_debug(residual,color,pw,ph)
 

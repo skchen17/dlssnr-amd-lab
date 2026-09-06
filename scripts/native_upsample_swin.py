@@ -75,5 +75,6 @@ class RecoveredUpsampleSwin(nn.Module):
             raise ValueError('positive window batch required')
         fused = self.fuse(low_outview,skip_packed,width,height)
         windows,mapping=gather_packed(pack_image(fused),width,height,self.channels,ox,oy)
-        logical=torch.cat([self.block(batch) for batch in windows.split(window_batch)])
+        from native_grid_policy import run_windows
+        logical=run_windows(self.block,windows,window_batch,f'c{self.channels}')
         return quantize_e4(scatter_packed(logical,mapping,width,height))

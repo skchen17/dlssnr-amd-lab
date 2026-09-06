@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "halted": true,
+  "halt_scope": "RGP_COUNTER_COLLECTION",
+  "non_profiler_gpu_tests_halted": false,
+  "date_local": "2026-09-06",
+  "reason": "Two RGP counter-collection attempts correlated with LiveKernelEvent 141 and unexpected system restarts.",
+  "invalid_artifacts": [
+    "results/20260906_rgp_pre_core_reference768_v1",
+    "results/20260906_rgp_pre_core_reference768_v2"
+  ],
+  "windows_evidence": {
+    "live_kernel_event_code": 141,
+    "watchdog_reports": [
+      "WATCHDOG-20260906-2218.dmp",
+      "WATCHDOG-20260906-2230.dmp"
+    ],
+    "system_events": [
+      "Kernel-Power 41",
+      "EventLog 6008",
+      "volmgr 161"
+    ]
+  },
+  "automatic_retry_allowed": false,
+  "tdr_change_allowed": false,
+  "clock_override_allowed": false,
+  "resume_requirements": [
+    "Review the driver/watchdog failure outside a GPU workload.",
+    "Use a reduced, isolated capture that cannot overlap another GPU process.",
+    "Obtain explicit user direction before setting halted to false."
+  ],
+  "limited_resume": {
+    "date_local": "2026-09-06",
+    "user_direction": "continue",
+    "allowed": "One minimal non-RGP correctness gate at a time, starting with one window and one iteration.",
+    "forbidden": "RGP counter collection, stress/performance loops, automatic retry, TDR or clock changes."
+  },
+  "last_minimal_gate": {
+    "date_local": "2026-09-06",
+    "artifact": "results/20260906_c32_staged_attention_gate1_v1",
+    "scope": "C32 staged attention, one window, one measured iteration, non-RGP",
+    "result": "PASS_BITWISE_EXACT_NORMAL_EXIT",
+    "new_system_gpu_or_restart_events": false,
+    "authorizes_next_gpu_gate": false
+  }
+}

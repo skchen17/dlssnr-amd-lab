@@ -80,14 +80,29 @@ class RecoveredPackedSwin(nn.Module):
         if matrix is not None and self.channels in (64,128,256) and family in matrix.modules:
             post=matrix.wide_ffn(self,windows)
             attention_family=f'c{self.channels}_attention'
+            bounded_family=f'c{self.channels}_attention_bounded'
+            if bounded_family in matrix.modules:return matrix.wide_attention_bounded(self.block.attention,post)
             return matrix.wide_attention(self.block.attention,post) if attention_family in matrix.modules else self.block.attention(post)
         attention_family=f'c{self.channels}_attention'
         if matrix is not None and self.channels in (64,128) and attention_family in matrix.modules:
             post=self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index])
             return matrix.wide_attention(self.block.attention,post)
+        bounded_family=f'c{self.channels}_attention_bounded'
+        if matrix is not None and self.channels in (64,128) and bounded_family in matrix.modules:
+            post=self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index])
+            return matrix.wide_attention_bounded(self.block.attention,post)
         if matrix is not None and self.channels==32 and 'c32_ffn' in matrix.modules:
             post=matrix.c32_ffn(self,windows)
+            if 'c32_attention_staged' in matrix.modules:return matrix.c32_attention_staged(self.block.attention,post)
+            if 'c32_attention_core' in matrix.modules:return matrix.c32_attention_core(self.block.attention,post)
+            if 'c32_attention_bounded' in matrix.modules:return matrix.c32_attention_bounded(self.block.attention,post)
             return matrix.c32_attention(self.block.attention,post) if 'c32_attention' in matrix.modules else self.block.attention(post)
+        if matrix is not None and self.channels==32 and 'c32_attention_bounded' in matrix.modules:
+            return matrix.c32_attention_bounded(self.block.attention,self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index]))
+        if matrix is not None and self.channels==32 and 'c32_attention_staged' in matrix.modules:
+            return matrix.c32_attention_staged(self.block.attention,self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index]))
+        if matrix is not None and self.channels==32 and 'c32_attention_core' in matrix.modules:
+            return matrix.c32_attention_core(self.block.attention,self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index]))
         if matrix is not None and self.channels==32 and 'c32_attention' in matrix.modules:
             return matrix.c32_attention(self.block.attention,self.block.ffn(windows[:,self.a_index],windows[:,self.residual_index]))
         return self.block(windows[:, self.a_index], windows[:, self.residual_index])

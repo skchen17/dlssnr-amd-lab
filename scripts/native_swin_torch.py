@@ -182,6 +182,8 @@ class RecoveredSwin32(nn.Module):
         first_output = self.forward_ffn(raw_windows)
         from native_matrix_fusion import active_matrix_fusion
         matrix=active_matrix_fusion()
+        if matrix is not None and self.record_kind=='head32' and 'head_attention_bounded' in matrix.modules:
+            return matrix.head_attention_bounded(self,first_output)
         if matrix is not None and self.record_kind=='head32' and 'head_attention' in matrix.modules:
             projection=matrix.head_qkv(self,first_output)
         else:projection = (quantized_gather(first_output,self.permutation) @ self._weight('qkv')).half()

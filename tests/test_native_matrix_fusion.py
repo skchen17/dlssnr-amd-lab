@@ -15,12 +15,18 @@ def test_profiles_and_unimplemented_modules_fail_closed():
             validate_config(profile,('head_ffn','head_attention','head_softmax','head_output','pre_input'),waves)
             validate_config(profile,('head_ffn','head_attention','head_softmax','head_output','c32_ffn'),waves)
             validate_config(profile,('head_ffn','head_attention','head_softmax','head_output','c32_ffn','c32_attention'),waves)
+            validate_config(profile,('c32_ffn','c32_attention_bounded'),waves)
+            validate_config(profile,('c32_ffn','c32_attention_staged'),waves)
+            validate_config(profile,('c32_ffn','c32_attention_core'),waves)
             validate_config(profile,('head_ffn','head_attention','head_softmax','head_output','c64_ffn','c128_ffn'),waves)
             validate_config(profile,('c64_ffn','c64_attention','c128_ffn','c128_attention'),waves)
+            validate_config(profile,('c64_ffn','c64_attention_bounded','c128_ffn','c128_attention_bounded'),waves)
             validate_config(profile,('c256_ffn',),waves)
             validate_config(profile,('c512_ffn',),waves)
     for args in [('other',('head_ffn',),1),('wmma_fp8',('vit',),1),('reference',('head_ffn',),3)]:
         with pytest.raises(ValueError):validate_config(*args)
+    with pytest.raises(ValueError,match='exactly one C32'):
+        validate_config('wmma_fp16',('c32_attention_bounded','c32_attention_staged'),2)
 
 
 def test_reference_is_noop_and_candidates_require_dll():
