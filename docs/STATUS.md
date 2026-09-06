@@ -6,6 +6,8 @@
 [`PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md`](PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md)。
 最新 Swin 主干重构实测见
 [`RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md`](RDNA4_SWIN_BACKBONE_REDESIGN_20260907.md)。
+完整 71-block `NRPlan` 迁移与 1080p A/B 见
+[`NATIVE_NR_PLAN_MIGRATION_20260907.md`](NATIVE_NR_PLAN_MIGRATION_20260907.md)。
 
 ## 已完成
 
@@ -43,8 +45,10 @@
   B-A-B-A整帧中位数1031.478→902.266 ms（−12.527%），这是当前可保留的显式候选。
 - C64/C128 attention的20 KiB per-head和2 KiB query-tile两案均未在代表规模稳定胜出，
   已拒绝且未复制到C256。
-- 已建立E4M3 resident-weight路径和C++/HIP `NRPlan`固定arena/Graph基础。前者C128仅
-  提速2.49%，未晋级；后者marker graph自测通过，但尚未装入完整71-block网络。
+- 已建立E4M3 resident-weight路径；C128仅提速2.49%，未晋级。完整71-block现已捕获为
+  C++ `NRPlan` HIP Graph并通过128/640/1080逐位一致门。最终选择配置1080p Python/NRPlan
+  B-A-B-A为311.863→266.008 ms（−14.703%），kernel节点16,558，设备用量约3.16 GB。
+  当前仍由Python捕获器保持权重和graph allocation pool，不等于C++独立资源所有权。
 
 ## 尚未完成
 
@@ -56,8 +60,9 @@
   最小门禁执行。
 - Pre 与跨 stage 数据流的进一步融合，以及后续 ViT 性能研究。
 - 游戏原生常驻执行器的最终 pre-HUD 接入和安全回退复验。
-- 将已通过的grouped FFN/transition/Head/Pre逐模块迁入原生`NRPlan`，并建立真正跨
-  kernel的resident FP8 activation；当前两者都只有基础设施，不能宣称整帧迁移完成。
+- 将完整图内仍由PyTorch持有的权重、workspace和ATen/library节点逐模块重绑定到C++
+  自有arena/module handle；随后建立真正跨kernel的resident FP8 activation。当前已经
+  完成整帧native submit与固定graph，不可宣称独立游戏部署runtime。
 
 ## 当前实验配置
 

@@ -24,7 +24,10 @@ class PreFeatures:
         if any(not x.is_cuda or x.device!=color.device or x.dtype!=torch.float16 or not x.is_contiguous() or x.requires_grad for x in (color,noise)):
             raise ValueError('pre fusion requires contiguous ROCm FP16 inference inputs')
         with torch.cuda.device(color.device):
-            constants=torch.tensor(conditioning,device=color.device,dtype=color.dtype)
+            constants=(conditioning if torch.is_tensor(conditioning) else
+                       torch.tensor(conditioning,device=color.device,dtype=color.dtype))
+            if constants.device!=color.device or constants.dtype!=color.dtype or constants.shape!=(5,):
+                raise ValueError('conditioning tensor must be resident FP16[5]')
             out=torch.empty((ph,pw,16),device=color.device,dtype=color.dtype)
             code=self.launch(color.data_ptr(),noise.data_ptr(),constants.data_ptr(),out.data_ptr(),w,h,pw,ph,float(scale),torch.cuda.current_stream(color.device).cuda_stream)
         if code:raise RuntimeError(f'pre feature launch failed {code}')
@@ -39,7 +42,10 @@ class PreFeatures:
         if any(not x.is_cuda or x.device!=color.device or x.dtype!=torch.float16 or not x.is_contiguous() or x.requires_grad for x in (color,noise,weight)):
             raise ValueError('Pre project/pack requires frozen contiguous ROCm FP16 inputs')
         with torch.cuda.device(color.device):
-            constants=torch.tensor(conditioning,device=color.device,dtype=color.dtype)
+            constants=(conditioning if torch.is_tensor(conditioning) else
+                       torch.tensor(conditioning,device=color.device,dtype=color.dtype))
+            if constants.device!=color.device or constants.dtype!=color.dtype or constants.shape!=(5,):
+                raise ValueError('conditioning tensor must be resident FP16[5]')
             out=torch.empty(ph*pw*32,device=color.device,dtype=color.dtype)
             code=self.project_pack_launch(color.data_ptr(),noise.data_ptr(),constants.data_ptr(),weight.data_ptr(),out.data_ptr(),
                 w,h,pw,ph,float(scale),torch.cuda.current_stream(color.device).cuda_stream)

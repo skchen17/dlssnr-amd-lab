@@ -60,7 +60,11 @@ def single_color_features(color,padded_width,padded_height,frame_seed,*,color_sc
     centered=((rgb-.5).half()*color_scale).half()
     noise=positional_noise(padded_width,padded_height,frame_seed,color.device)
     one=torch.ones_like(centered[...,:1])
-    constants=torch.tensor(conditioning,device=color.device,dtype=torch.float16).expand(padded_height,padded_width,5)
+    constants=(conditioning if torch.is_tensor(conditioning) else
+               torch.tensor(conditioning,device=color.device,dtype=torch.float16))
+    if constants.device!=color.device or constants.dtype!=torch.float16 or constants.shape!=(5,):
+        raise ValueError('conditioning tensor must be resident FP16[5]')
+    constants=constants.expand(padded_height,padded_width,5)
     # Shared filler: noise3,1,currentRGB3,previousRGB3, five condition values,0.
     # Null-history branch explicitly uses currentRGB as previousRGB.
     return torch.cat([noise,one,centered,centered,constants,torch.zeros_like(one)],-1)

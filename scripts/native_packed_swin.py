@@ -54,9 +54,15 @@ def scatter_packed(values, mapping, width, height):
     row = lane // 4 + element % 8 // 4 * 8
     col = head * 32 + lane % 4 * 2 + element % 4 // 2 * 8 + element // 8 * 16 + (element & 1)
     packed = values.reshape(-1, 4, 16, channels)[:, :, row, col]
-    result = torch.zeros((height // 4 * (width // 4), 16 * channels), device=values.device, dtype=values.dtype)
-    result[index[valid]] = packed[valid]
-    return result.flatten()
+    cells=height//4*(width//4)
+    # Boolean advanced indexing calls a dynamic nonzero/indexPut path that HIP
+    # Graph cannot capture. Each valid cell occurs once, so a fixed-shape
+    # index_copy is equivalent. Invalid entries target one discarded sentinel
+    # row and cannot overwrite any real cell.
+    safe_index=torch.where(valid,index,cells).reshape(-1)
+    result=torch.zeros((cells+1,16*channels),device=values.device,dtype=values.dtype)
+    result.index_copy_(0,safe_index,packed.reshape(-1,16*channels))
+    return result[:-1].flatten()
 
 
 class RecoveredPackedSwin(nn.Module):

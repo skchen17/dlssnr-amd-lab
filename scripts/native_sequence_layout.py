@@ -8,9 +8,10 @@ def sequence_indices(tokens, channels, *, device=None):
     t, c = torch.arange(tokens, device=device)[:, None], torch.arange(channels, device=device)[None, :]
     row, col = t % 16, c % 32
     mma = col // 16 * 2 + col % 16 // 8
-    pairs = torch.tensor([0, 2, 1, 3, 4, 6, 5, 7], device=device)
     element = (row >= 8) * 2 + (col & 1)
-    operation = pairs[mma * 2 + element // 2]
+    pair_index=mma*2+element//2
+    # [0,2,1,3,4,6,5,7] without a per-call host->device constant.
+    operation=(pair_index&4)|((pair_index&1)<<1)|((pair_index&2)>>1)
     return (t // 16 * (16 * channels) + c // 32 * 512
             + (row % 8 * 4 + col % 8 // 2) * 16 + operation * 2 + (element & 1)).long()
 

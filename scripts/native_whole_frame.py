@@ -42,7 +42,11 @@ class SingleColorWholeFrame(nn.Module):
         if max_padded_pixels<=0:
             raise ValueError('explicit positive offline workspace pixel budget required')
         self.max_padded_pixels=max_padded_pixels
-        self.color_scale,self.conditioning=color_scale,conditioning
+        self.color_scale=color_scale
+        # Fixed model conditioning is a resident buffer. Constructing it from
+        # host values inside forward is both needless per-frame setup and an
+        # unsupported operation during HIP Graph capture.
+        self.register_buffer('conditioning',torch.tensor(conditioning,dtype=torch.float16))
         self.pre=RecoveredSingleColorPreblock(records[(0,0)])
         modules={}
         for first,last,c in [(1,4,32),(5,8,64),(9,14,128),(15,22,256)]:

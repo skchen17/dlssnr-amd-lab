@@ -93,13 +93,28 @@ def exercise(a,phase):
         if refmeta['sha256']!=meta['sha256'] or refmeta['geometry']!=meta['geometry']:raise ValueError('reference input differs')
         reference=sha(a.reference_output.read_bytes())
     grid_families=tuple(filter(None,a.whole_grid_families.split(',')))
-    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families),transition_policy(resident=a.resident_transitions,capture_outviews=a.capture_transition_outviews),transition_fusion(a.transition_dll,encoder=a.encoder_transition,decoder=a.decoder_transition) as transitions:
+    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv,whole_grid='head' in grid_families) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families),transition_policy(resident=a.resident_transitions,capture_outviews=a.capture_transition_outviews),transition_fusion(a.transition_dll,encoder=a.encoder_transition,decoder=a.decoder_transition) as transitions:
+        plan=None;plan_graph_stats=None
+        if a.cpp_nr_plan_dll:
+            from native_cpp_nr_plan import CapturedNRPlan
+            def plan_wait(stream):
+                event=torch.cuda.Event()
+                with torch.cuda.stream(stream):event.record()
+                wait(event)
+            plan=CapturedNRPlan(a.cpp_nr_plan_dll,
+                lambda source:model(source,0,window_batch=768,query_chunk=1024),color,
+                wait=plan_wait,lifetimes=(model,fused,head_fused,pre_fused,c32_fused,matrix,transitions))
+            plan_graph_stats=dict(plan.graph_stats)
+            phase('cpp_nr_plan_captured')
         for index in range(a.iterations):
-            wait();torch.cuda.reset_peak_memory_stats()
+            plan_wait(plan.stream) if plan else wait();torch.cuda.reset_peak_memory_stats()
             begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
-            start=time.perf_counter();begin.record()
-            value=model(color,0,window_batch=768,query_chunk=1024)
-            end.record();wait(end);host=(time.perf_counter()-start)*1000
+            active_stream=plan.stream if plan else torch.cuda.current_stream()
+            start=time.perf_counter()
+            with torch.cuda.stream(active_stream):begin.record()
+            value=plan.submit(color) if plan else model(color,0,window_batch=768,query_chunk=1024)
+            with torch.cuda.stream(active_stream):end.record()
+            wait(end);host=(time.perf_counter()-start)*1000
             event_ms=begin.elapsed_time(end)
             # Validation, finite scan and readback are OUTSIDE measured interval.
             finite=torch.isfinite(value).all();wait()
@@ -114,6 +129,8 @@ def exercise(a,phase):
                   'gpu_stream_elapsed_ms':event_ms if clock_ok and math.isfinite(event_ms) and 0<event_ms<=host*1.25 else None,
                   'peak_allocated_bytes':torch.cuda.max_memory_allocated(),'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
                   'device_used_bytes_sample':total-free,'output_sha256':reference}
+            item['cpp_nr_plan']=bool(plan)
+            item['cpp_nr_plan_sequence']=plan.sequence if plan else 0
             item['authored_fusions_cumulative']=fused.counts() if fused else None
             item['head_input_launches_cumulative']=head_fused.launches if head_fused else 0
             item['head_compose_launches_cumulative']=head_fused.compose_launches if head_fused else 0
@@ -132,6 +149,8 @@ def exercise(a,phase):
             with (a.output/'runs.jsonl').open('a') as f:f.write(json.dumps(item)+'\n')
             phase(f'frame{index}_validated')
             del value,finite,out,begin,end
+        if plan:
+            plan.close(plan_wait);phase('cpp_nr_plan_destroyed')
         counter=OperatorCounter()
         if a.drain_stages:
             # Diagnostic only: per-stage draining changes overlap/scheduling.
@@ -218,12 +237,17 @@ def exercise(a,phase):
     phase('gpu_work_complete')
     return {'checks_pass':True,'input':meta,'runs':runs,'clock_sanity':clock,'clock_sanity_pass':clock_ok,
             'host_warm_median_ms':statistics.median(r['host_forward_submit_wait_ms'] for r in runs[1:]) if len(runs)>1 else None,
-            'gpu_dispatch_count':None,'gpu_busy_kernel_sum_ms':None,'gpu_profiler_available':False,
+            'gpu_dispatch_count':plan_graph_stats['kernel_nodes'] if plan_graph_stats else None,
+            'gpu_graph_nodes':plan_graph_stats,'gpu_busy_kernel_sum_ms':None,'gpu_profiler_available':False,
             'fusion_dll_sha256':sha(a.fusion_dll.read_bytes()) if a.fusion_dll else None,
             'head_input_dll_sha256':sha(a.head_input_dll.read_bytes()) if a.head_input_dll else None,
             'matrix_dll_sha256':sha(a.matrix_dll.read_bytes()) if a.matrix_dll else None,
             'matrix_profile':a.matrix_profile,'matrix_waves':a.matrix_waves,
             'matrix_modules':a.matrix_modules,
+            'cpp_nr_plan_dll_sha256':sha(a.cpp_nr_plan_dll.read_bytes()) if a.cpp_nr_plan_dll else None,
+            'cpp_nr_plan_classification':'CPP_OWNED_CAPTURED_KERNEL_GRAPH' if a.cpp_nr_plan_dll else None,
+            'python_operations_per_frame':0 if a.cpp_nr_plan_dll else None,
+            'full_math_reauthored':False if a.cpp_nr_plan_dll else None,
             'pre_features_dll_sha256':sha(a.pre_features_dll.read_bytes()) if a.pre_features_dll else None,
             'pre_project_pack':a.pre_project_pack,'whole_grid_families':list(grid_families),
             'resident_transitions':a.resident_transitions,'capture_transition_outviews':a.capture_transition_outviews,
@@ -271,6 +295,7 @@ if __name__=='__main__':
     p.add_argument('--matrix-profile',choices=('reference','wmma_fp16','wmma_fp8'),default='reference')
     p.add_argument('--matrix-waves',type=int,choices=(1,2,4),default=1)
     p.add_argument('--matrix-modules',default='head_ffn',help='comma-separated reviewed module names; policy rejects unknown values')
+    p.add_argument('--cpp-nr-plan-dll',type=Path)
     p.add_argument('--measure-head',action='store_true')
     p.add_argument('--head-gather',action='store_true')
     p.add_argument('--head-weight-cache',action='store_true')
@@ -300,6 +325,7 @@ if __name__=='__main__':
     if a.decoder_transition and (not a.transition_dll or not a.resident_transitions or not a.reference_output):p.error('decoder transition requires DLL, resident routing, and same-input reference')
     if a.transition_dll and not (a.encoder_transition or a.decoder_transition):p.error('transition DLL requires an explicit transition selection')
     if a.matrix_profile!='reference' and (not a.matrix_dll or not a.reference_output):p.error('matrix candidate requires DLL and explicit reference')
+    if a.cpp_nr_plan_dll and (a.count_operators or a.stage_timestamps or a.drain_stages or a.measure_head):p.error('NRPlan timing cannot be mixed with diagnostic reruns')
     if a.child:raise SystemExit(0 if child(a) else 2)
     a.output.mkdir(parents=True,exist_ok=False);fixture(a.output,a.size)
     command=[sys.executable,str(Path(__file__).resolve()),'--child','--output',str(a.output.resolve()),'--size',a.size,'--iterations',str(a.iterations)]
@@ -309,6 +335,7 @@ if __name__=='__main__':
     if a.fusion_dll:command+=['--fusion-dll',str(a.fusion_dll.resolve())]
     if a.head_input_dll:command+=['--head-input-dll',str(a.head_input_dll.resolve())]
     if a.matrix_dll:command+=['--matrix-dll',str(a.matrix_dll.resolve())]
+    if a.cpp_nr_plan_dll:command+=['--cpp-nr-plan-dll',str(a.cpp_nr_plan_dll.resolve())]
     command+=['--matrix-profile',a.matrix_profile,'--matrix-waves',str(a.matrix_waves),'--matrix-modules',a.matrix_modules]
     if a.measure_head:command+=['--measure-head']
     command+=['--measure-block',str(a.measure_block)]

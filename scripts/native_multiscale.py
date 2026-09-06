@@ -68,7 +68,8 @@ def unpack_planar16(packed, width, height, channels):
 
 def outview_channels(device=None):
     """One store joins pairs from columns N0 and N8 of the same MMA lane."""
-    return torch.tensor([0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15], device=device)
+    index=torch.arange(16,device=device)
+    return index//4*2+(index%4//2)*8+index%2
 
 
 def pack_outview(logical):
