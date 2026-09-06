@@ -70,11 +70,35 @@ class RecoveredUpsampleSwin(nn.Module):
         expanded = projected.repeat_interleave(2,0).repeat_interleave(2,1)
         return expanded+(skip*self.skip_scale).half()
 
+    def fuse_resident(self,low_packed,skip_packed,width,height):
+        c=self.channels
+        if width<=0 or height<=0 or width%8 or height%8:
+            raise ValueError('upsample requires positive eight-aligned destination features')
+        if any(t.dtype!=torch.float16 or t.device!=self.project.device for t in (low_packed,skip_packed)):
+            raise ValueError('actual decoded inputs and original parameters must share FP16/device')
+        from native_transition_fusion import active_transition_fusion
+        fusion=active_transition_fusion()
+        if fusion is not None and fusion.decoder_enabled:
+            return fusion.decoder(low_packed,skip_packed,width,height,c,self.permutation,self.project,self.skip_scale)
+        low=unpack_image(low_packed,width//2,height//2,2*c)
+        skip=unpack_image(skip_packed,width,height,c)
+        projected=chunked_linear(low[...,self.permutation],self.project)
+        expanded=projected.repeat_interleave(2,0).repeat_interleave(2,1)
+        return pack_image(expanded+(skip*self.skip_scale).half())
+
+    def _forward_packed(self,fused,width,height,ox,oy,window_batch):
+        windows,mapping=gather_packed(fused,width,height,self.channels,ox,oy)
+        from native_grid_policy import run_windows
+        logical=run_windows(self.block,windows,window_batch,f'c{self.channels}')
+        return quantize_e4(scatter_packed(logical,mapping,width,height))
+
+    def forward_resident(self,low_packed,skip_packed,width,height,ox,oy,*,window_batch=12):
+        if window_batch<=0:raise ValueError('positive window batch required')
+        return self._forward_packed(self.fuse_resident(low_packed,skip_packed,width,height),
+                                    width,height,ox,oy,window_batch)
+
     def forward(self,low_outview,skip_packed,width,height,ox,oy,*,window_batch=12):
         if window_batch<=0:
             raise ValueError('positive window batch required')
         fused = self.fuse(low_outview,skip_packed,width,height)
-        windows,mapping=gather_packed(pack_image(fused),width,height,self.channels,ox,oy)
-        from native_grid_policy import run_windows
-        logical=run_windows(self.block,windows,window_batch,f'c{self.channels}')
-        return quantize_e4(scatter_packed(logical,mapping,width,height))
+        return self._forward_packed(pack_image(fused),width,height,ox,oy,window_batch)

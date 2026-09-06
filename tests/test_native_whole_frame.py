@@ -26,3 +26,11 @@ def test_single_color_candidate_does_not_claim_temporal_hdr_or_game():
     assert not SingleColorWholeFrame.native_graph_complete
     assert not SingleColorWholeFrame.hdr_supported
     assert not SingleColorWholeFrame.game_runtime_ready
+
+
+def test_resident_name_maps_to_split512_packed_abi():
+    # Transition policy calls the lifetime state "resident"; Split512 names
+    # the exact same physical storage layout "packed".
+    source=Path(__file__).resolve().parents[1]/'scripts'/'native_whole_frame.py'
+    text=source.read_text(encoding='utf-8')
+    assert "'packed' if value_layout=='resident' else value_layout" in text

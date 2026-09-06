@@ -31,18 +31,24 @@ class RecoveredSplitImage512(nn.Module):
         self.register_buffer('a_index',a)
         self.register_buffer('residual_index',r)
 
-    def forward(self,source,width,height,ox,oy,*,window_batch=12):
+    def forward(self,source,width,height,ox,oy,*,window_batch=12,source_layout=None,output_layout=None):
         if window_batch<=0:
             raise ValueError('positive window batch required')
-        if self.input_layout=='outview':
+        layout=self.input_layout if source_layout is None else source_layout
+        target=self.output_layout if output_layout is None else output_layout
+        if layout not in ('packed','outview'):
+            raise ValueError('explicit packed/outview source layout required')
+        if target not in ('packed','outview','pool'):
+            raise ValueError('explicit packed/outview/pool target layout required')
+        if layout=='outview':
             source=pack_image(unpack_outview(source,width,height,512))
         windows,mapping=gather_packed(source,width,height,512,ox,oy)
         values=torch.cat([self.block.unquantized(p[:,self.a_index],p[:,self.residual_index])
                           for p in windows.split(window_batch)])
         packed=scatter_packed(values,mapping,width,height)
-        if self.output_layout=='pool':
+        if target=='pool':
             logical=unpack_image(packed,width,height,512)
             return {'skip':quantize_e4(packed),'pooled':pool_to_bottleneck(logical)}
-        if self.output_layout=='outview':
+        if target=='outview':
             packed=pack_outview(unpack_image(packed,width,height,512))
         return quantize_e4(packed)

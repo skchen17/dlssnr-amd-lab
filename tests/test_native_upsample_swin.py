@@ -5,7 +5,7 @@ torch=pytest.importorskip('torch')
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from native_upsample_swin import RecoveredUpsampleSwin,RECORD_SIZES,plain_record,sections
 from native_window_attention import LAYOUTS
-from native_multiscale import pack_image,pack_outview
+from native_multiscale import pack_image,pack_outview,unpack_image
 
 
 @pytest.mark.parametrize('kind',list(RECORD_SIZES))
@@ -31,3 +31,14 @@ def test_shape_and_record_gaps_cannot_be_silently_filled():
         plain_record(bytes(22783),'swin32')
     with pytest.raises(ValueError):
         sections('unknown')
+
+
+@pytest.mark.parametrize('kind',list(RECORD_SIZES))
+def test_resident_fuse_matches_outview_adapter(kind):
+    raw=bytes(RECORD_SIZES[kind]);model=RecoveredUpsampleSwin(raw,record_kind=kind);c=model.channels
+    with torch.no_grad():model.skip_scale.fill_(1)
+    logical=torch.arange(4*4*2*c).reshape(4,4,2*c).half()/1024
+    skip=torch.arange(8*8*c).reshape(8,8,c).half()/2048
+    legacy=model.fuse(pack_outview(logical),pack_image(skip),8,8)
+    resident=model.fuse_resident(pack_image(logical),pack_image(skip),8,8)
+    assert torch.equal(unpack_image(resident,8,8,c),legacy)

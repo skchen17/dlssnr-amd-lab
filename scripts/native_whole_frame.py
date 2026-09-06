@@ -78,24 +78,37 @@ class SingleColorWholeFrame(nn.Module):
         pw,ph=feature_geometry(w,h,self.max_padded_pixels)
         pre=self.pre(color,pw,ph,frame_seed,color_scale=self.color_scale,conditioning=self.conditioning,
                      window_batch=boundary_batch)
-        value=pre['outview']; skips={}
+        from native_transition_policy import active_transition_policy
+        transition=active_transition_policy()
+        value=pre['outview'];value_layout='outview';skips={}
         yield 0,value
         for first,last,c in [(1,4,32),(5,8,64),(9,14,128),(15,22,256)]:
             sw,sh=pw//2//(c//32),ph//2//(c//32)
             for b in range(first,last+1):
                 model=self.encoder[str(b)]; ox,oy=self.origins[b]
-                if b in (first,last):
-                    value=model(value,sw,sh,ox,oy,window_batch=window_batch)
+                if b==first:
+                    value=(model.forward_resident(value,sw,sh,ox,oy,window_batch=window_batch)
+                           if value_layout=='resident' else model(value,sw,sh,ox,oy,window_batch=window_batch))
+                    value_layout='resident'
+                elif b==last:
+                    value=model(value,sw,sh,ox,oy,window_batch=window_batch,
+                                capture_layouts=not transition.resident or transition.capture_outviews)
                 else:
                     windows,mapping=gather_packed(value,sw,sh,c,ox,oy)
                     from native_grid_policy import run_windows
                     value=quantize_e4(scatter_packed(run_windows(model,windows,window_batch,f'c{c}'),mapping,sw,sh))
                 if b==last:
-                    skips[c]=value['skip']; value=value['captured_outview']
+                    skips[c]=value['skip']
+                    if transition.resident:
+                        value=value['resident'];value_layout='resident'
+                    else:
+                        value=value['captured_outview'];value_layout='outview'
                 yield b,value
         sw,sh=pw//32,ph//32
         for b in range(23,31):
-            value=self.encoder512[str(b)](value,sw,sh,*self.origins[b],window_batch=window_batch)
+            value=self.encoder512[str(b)](value,sw,sh,*self.origins[b],window_batch=window_batch,
+                source_layout=('packed' if value_layout=='resident' else value_layout) if b==23 else None)
+            value_layout='resident'
             if b==30:
                 skips[512]=value['skip']; value=self.enc_project(value['pooled'])
             yield b,value
@@ -108,7 +121,8 @@ class SingleColorWholeFrame(nn.Module):
         value=pack_image(value)
         yield 39,value
         for b in range(40,48):
-            value=self.decoder512[str(b)](value,sw,sh,*self.origins[b],window_batch=window_batch)
+            value=self.decoder512[str(b)](value,sw,sh,*self.origins[b],window_batch=window_batch,
+                output_layout='packed' if b==47 and transition.resident else None)
             yield b,value
         for b,value in self.decoder.stages(value,{c:skips[c] for c in (32,64,128,256)},pw//2,ph//2,window_batch=window_batch):
             yield b,value

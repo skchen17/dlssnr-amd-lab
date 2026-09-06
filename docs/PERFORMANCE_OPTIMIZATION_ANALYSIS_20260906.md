@@ -225,6 +225,9 @@ ViT目前不是已知最大热点，继续保持基准，除非未来可靠profi
 - C32 corrected bounded：`results/20260906_c32_bounded_attention_rounding_fix_gate1_v1`、`gate16_v1`
 - C32 staged：`results/20260906_c32_staged_attention_build_v1`、`gate1_v1`
 - 4K C512 A-B-B-A：`results/20260906_c512_only_abba_a1`、`b1`、`b2`、`a2`
+- Encoder/Decoder尺度切换：`docs/SCALE_TRANSITION_OPTIMIZATION_20260907.md`
+- 1080p/1440p transition汇总：`results/20260907_transition_abba_aggregate_v1`
+- 1080p/1440p整帧A-B-B-A汇总：`results/20260907_whole_frame_transition_abba_v1`
 
 `results/`和`local_models/`均不进入Git：报告保留可复查的目录名和摘要，私有权重、教师
 数据、原始帧、编译产物和大型profile不会上传公共仓库。

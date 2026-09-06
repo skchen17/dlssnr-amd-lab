@@ -51,8 +51,17 @@ def test_downsample_has_distinct_skip_and_next_scale(kind):
     c = model.channels
     output = model(torch.zeros(8*8*c).half(), 8, 8, -4, -4)
     assert output['skip'].numel() == 64*c and output['downsampled'].numel() == 32*c
+    assert output['resident'] is output['downsampled']
     assert output['target_size'] == (4, 4)
     assert torch.count_nonzero(output['downsampled']) == 0
+
+
+@pytest.mark.parametrize('kind',list(DOWNSAMPLE_RECORDS))
+def test_resident_downsample_omits_debug_outview(kind):
+    model=RecoveredDownsampleSwin(bytes(DOWNSAMPLE_RECORDS[kind]),record_kind=kind)
+    c=model.channels
+    output=model(torch.zeros(8*8*c).half(),8,8,-4,-4,capture_layouts=False)
+    assert set(output)=={'skip','resident','source_size','target_size'}
 
 
 def test_malformed_geometry_rejected():

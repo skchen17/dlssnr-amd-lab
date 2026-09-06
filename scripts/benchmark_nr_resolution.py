@@ -48,6 +48,8 @@ def exercise(a,phase):
     from native_c32_layout_fusion import c32_layout_fusion
     from native_matrix_fusion import matrix_fusion
     from native_grid_policy import grid_policy
+    from native_transition_policy import transition_policy
+    from native_transition_fusion import transition_fusion
     torch.set_num_threads(2)
     if not torch.version.hip or not torch.cuda.is_available():raise RuntimeError('ROCm required')
     props=torch.cuda.get_device_properties(0)
@@ -91,7 +93,7 @@ def exercise(a,phase):
         if refmeta['sha256']!=meta['sha256'] or refmeta['geometry']!=meta['geometry']:raise ValueError('reference input differs')
         reference=sha(a.reference_output.read_bytes())
     grid_families=tuple(filter(None,a.whole_grid_families.split(',')))
-    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families):
+    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families),transition_policy(resident=a.resident_transitions,capture_outviews=a.capture_transition_outviews),transition_fusion(a.transition_dll,encoder=a.encoder_transition,decoder=a.decoder_transition) as transitions:
         for index in range(a.iterations):
             wait();torch.cuda.reset_peak_memory_stats()
             begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
@@ -122,6 +124,7 @@ def exercise(a,phase):
             item['pre_features_launches_cumulative']=pre_fused.launches if pre_fused else 0
             item['pre_project_pack_launches_cumulative']=pre_fused.project_pack_launches if pre_fused else 0
             item['c32_layout_launches_cumulative']={'gather':c32_fused.gather_calls,'scatter':c32_fused.scatter_calls} if c32_fused else None
+            item['transition_counts_cumulative']=transitions.counts() if transitions else None
             if item['peak_reserved_bytes']>5000000000 or total-free>6000000000:raise RuntimeError('memory envelope exceeded')
             runs.append(item)
             with (a.output/'runs.jsonl').open('a') as f:f.write(json.dumps(item)+'\n')
@@ -221,6 +224,10 @@ def exercise(a,phase):
             'matrix_modules':a.matrix_modules,
             'pre_features_dll_sha256':sha(a.pre_features_dll.read_bytes()) if a.pre_features_dll else None,
             'pre_project_pack':a.pre_project_pack,'whole_grid_families':list(grid_families),
+            'resident_transitions':a.resident_transitions,'capture_transition_outviews':a.capture_transition_outviews,
+            'transition_dll_sha256':sha(a.transition_dll.read_bytes()) if a.transition_dll else None,
+            'encoder_transition':a.encoder_transition,
+            'decoder_transition':a.decoder_transition,
             'c32_layout_dll_sha256':sha(a.c32_layout_dll.read_bytes()) if a.c32_layout_dll else None,
             'reference_output_sha256':sha(a.reference_output.read_bytes()) if a.reference_output else None,
             'timing_scope':'Full-forward host submit/wait excludes finite checks and image readback; event span includes stream idle gaps and is not kernel busy sum',
@@ -234,8 +241,16 @@ def child(a):
     def phase(name):
         with (a.output/'phases.jsonl').open('a') as f:f.write(json.dumps({'phase':name,'pid':os.getpid()})+'\n')
     atexit.register(phase,'python_atexit')
-    result=exercise(a,phase)
-    import torch
+    import torch,traceback
+    try:
+        result=exercise(a,phase)
+    except BaseException as error:
+        # Do not leave traceback frames retaining multi-GB CUDA tensors until
+        # interpreter teardown. Record failure, then make one normal cleanup
+        # attempt; never retry the workload or claim the GPU was cancelled.
+        traceback.print_exc(file=trace);trace.flush();phase('gpu_work_failed')
+        result={'checks_pass':False,'error_type':type(error).__name__,'error':str(error),
+                'gpu_work_cancelled':False,'automatic_retry':False}
     gc.collect();torch.cuda.empty_cache();torch._C._cuda_clearCublasWorkspaces();torch.cuda.empty_cache()
     result['allocated_after_release_bytes']=torch.cuda.memory_allocated();result['reserved_after_release_bytes']=torch.cuda.memory_reserved()
     result['sources_unchanged']=all(sha(Path(p).read_bytes())==h for p,h in sources.items())
@@ -263,6 +278,11 @@ if __name__=='__main__':
     p.add_argument('--pre-project-pack',action='store_true')
     p.add_argument('--whole-grid-families',default='',help='comma-separated reviewed families such as pre,c32')
     p.add_argument('--c32-layout-dll',type=Path)
+    p.add_argument('--resident-transitions',action='store_true')
+    p.add_argument('--capture-transition-outviews',action='store_true')
+    p.add_argument('--transition-dll',type=Path)
+    p.add_argument('--encoder-transition',action='store_true')
+    p.add_argument('--decoder-transition',action='store_true')
     p.add_argument('--measure-block',type=int,choices=(0,2,70),default=70)
     p.add_argument('--stage-timestamps',action='store_true')
     p.add_argument('--drain-stages',action='store_true')
@@ -273,6 +293,10 @@ if __name__=='__main__':
     if a.pre_features_dll and not a.reference_output:p.error('pre fusion requires same-input reference')
     if a.pre_project_pack and not a.pre_features_dll:p.error('pre project/pack requires --pre-features-dll')
     if a.c32_layout_dll and not a.reference_output:p.error('C32 fusion requires same-input reference')
+    if a.capture_transition_outviews and not a.resident_transitions:p.error('transition outview capture requires resident transitions')
+    if a.encoder_transition and (not a.transition_dll or not a.resident_transitions or not a.reference_output):p.error('encoder transition requires DLL, resident routing, and same-input reference')
+    if a.decoder_transition and (not a.transition_dll or not a.resident_transitions or not a.reference_output):p.error('decoder transition requires DLL, resident routing, and same-input reference')
+    if a.transition_dll and not (a.encoder_transition or a.decoder_transition):p.error('transition DLL requires an explicit transition selection')
     if a.matrix_profile!='reference' and (not a.matrix_dll or not a.reference_output):p.error('matrix candidate requires DLL and explicit reference')
     if a.child:raise SystemExit(0 if child(a) else 2)
     a.output.mkdir(parents=True,exist_ok=False);fixture(a.output,a.size)
@@ -294,5 +318,10 @@ if __name__=='__main__':
     if a.pre_project_pack:command.append('--pre-project-pack')
     if a.whole_grid_families:command+=['--whole-grid-families',a.whole_grid_families]
     if a.c32_layout_dll:command+=['--c32-layout-dll',str(a.c32_layout_dll.resolve())]
+    if a.resident_transitions:command.append('--resident-transitions')
+    if a.capture_transition_outviews:command.append('--capture-transition-outviews')
+    if a.transition_dll:command+=['--transition-dll',str(a.transition_dll.resolve())]
+    if a.encoder_transition:command.append('--encoder-transition')
+    if a.decoder_transition:command.append('--decoder-transition')
     if a.reference_output:command+=['--reference-output',str(a.reference_output.resolve())]
     raise SystemExit(0 if supervise(command,a.output,timeout=180) else 2)

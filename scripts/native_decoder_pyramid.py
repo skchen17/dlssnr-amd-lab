@@ -45,20 +45,29 @@ class RecoveredDecoderPyramid(nn.Module):
             raise ValueError('explicit full feature dimensions need64-alignment and positive batch')
         if set(skips)!={32,64,128,256}:
             raise ValueError('four genuine encoder skip inputs required')
-        value=low_outview
+        from native_transition_policy import active_transition_policy
+        transition=active_transition_policy()
+        value=low_outview;value_layout='resident' if transition.resident else 'outview'
         for block in range(48,70):
             c,role=stage_role(block)
             w,h=width//(c//32),height//(c//32)
             model=self.blocks[str(block)]
             ox,oy=self.origins[block]
             if role=='upsample':
-                value=model(value,skips[c],w,h,ox,oy,window_batch=window_batch)
+                value=(model.forward_resident(value,skips[c],w,h,ox,oy,window_batch=window_batch)
+                       if value_layout=='resident' else model(value,skips[c],w,h,ox,oy,window_batch=window_batch))
+                value_layout='resident'
             else:
                 windows,mapping=gather_packed(value,w,h,c,ox,oy)
                 from native_grid_policy import run_windows
                 logical=run_windows(model,windows,window_batch,f'c{c}')
                 packed=scatter_packed(logical,mapping,w,h)
-                value=pack_outview(unpack_image(packed,w,h,c)) if role=='outview' else packed
+                # Blocks55/61/65 feed another native upsample transition and
+                # can stay packed. Block69 still feeds the recovered Head ABI,
+                # whose planar/outview contract has not changed.
+                needs_outview=role=='outview' and (not transition.resident or block==69)
+                value=pack_outview(unpack_image(packed,w,h,c)) if needs_outview else packed
+                value_layout='outview' if needs_outview else 'resident'
                 value=quantize_e4(value)
             yield block,value
 

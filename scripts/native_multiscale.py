@@ -93,14 +93,24 @@ class RecoveredOutviewSwin(nn.Module):
         self.block = RecoveredPackedSwin(raw, record_kind=record_kind)
         self.channels = self.block.channels
 
-    def forward(self, source, width, height, ox, oy, *, window_batch=12):
-        if window_batch <= 0 or source.dtype != torch.float16:
-            raise ValueError('positive window batch and decoded FP16 source required')
-        packed = pack_image(unpack_outview(source, width, height, self.channels))
+    def _forward_packed(self, packed, width, height, ox, oy, window_batch):
+        if packed.ndim != 1 or packed.numel() != width*height*self.channels:
+            raise ValueError('resident packed feature size mismatch')
         windows, mapping = gather_packed(packed, width, height, self.channels, ox, oy)
         from native_grid_policy import run_windows
         values = run_windows(self.block, windows, window_batch, f'c{self.channels}')
         return quantize_e4(scatter_packed(values, mapping, width, height))
+
+    def forward_resident(self, source, width, height, ox, oy, *, window_batch=12):
+        if window_batch <= 0 or source.dtype != torch.float16:
+            raise ValueError('positive window batch and decoded FP16 resident source required')
+        return self._forward_packed(source,width,height,ox,oy,window_batch)
+
+    def forward(self, source, width, height, ox, oy, *, window_batch=12):
+        if window_batch <= 0 or source.dtype != torch.float16:
+            raise ValueError('positive window batch and decoded FP16 source required')
+        packed = pack_image(unpack_outview(source, width, height, self.channels))
+        return self._forward_packed(packed,width,height,ox,oy,window_batch)
 
 
 class RecoveredDownsampleSwin(nn.Module):
@@ -122,7 +132,7 @@ class RecoveredDownsampleSwin(nn.Module):
         parameter(self, 'pool_project', decode_e4(raw)[matrix_indices(c, 2*c, tail)])
         self.register_buffer('permutation', channel_permutation(c))
 
-    def forward(self, packed, width, height, ox, oy, *, window_batch=12):
+    def forward(self, packed, width, height, ox, oy, *, window_batch=12, capture_layouts=True):
         if window_batch <= 0 or width % 8 or height % 8:
             raise ValueError('downsample needs positive batch and eight-aligned source geometry')
         if packed.device != self.pool_project.device or packed.dtype != torch.float16:
@@ -131,8 +141,19 @@ class RecoveredDownsampleSwin(nn.Module):
         from native_grid_policy import run_windows
         projected = run_windows(self.block, windows, window_batch, f'c{self.channels}')
         unquantized = scatter_packed(projected, mapping, width, height)
+        from native_transition_fusion import active_transition_fusion
+        fusion=active_transition_fusion()
+        if fusion is not None and fusion.encoder_enabled:
+            return fusion.encoder(unquantized,width,height,self.channels,self.permutation,self.pool_project,
+                                  capture_layouts=capture_layouts)
         pooled = average_pool2x2(unpack_image(unquantized, width, height, self.channels))
         down = quantize_e4(chunked_linear(pooled[..., self.permutation], self.pool_project))
-        return {'skip': quantize_e4(unquantized), 'downsampled': pack_image(down),
-                'captured_outview': pack_outview(down),
-                'source_size': (width, height), 'target_size': (width//2, height//2)}
+        resident=pack_image(down)
+        result={'skip':quantize_e4(unquantized),'resident':resident,
+                'source_size':(width,height),'target_size':(width//2,height//2)}
+        if capture_layouts:
+            # Compatibility/debug aliases. `downsampled` is the same tensor as
+            # resident, not a second allocation; outview is explicitly materialized.
+            result['downsampled']=resident
+            result['captured_outview']=pack_outview(down)
+        return result
