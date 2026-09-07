@@ -41,3 +41,20 @@ def test_missing_state_file_does_not_block(tmp_path, monkeypatch):
     monkeypatch.setattr(gpu_safety, "HALT_FILE", tmp_path / "missing.json")
     gpu_safety.require_gpu_tests_enabled("minimal gate")
     gpu_safety.require_gpu_tests_enabled("RGP capture", profiler=True)
+
+
+def test_negative_last_gate_authorization_blocks_followup_gpu_submission(tmp_path, monkeypatch):
+    halt = tmp_path / "halt.json"
+    _write_state(halt, last_minimal_gate={"authorizes_next_gpu_gate": False})
+    monkeypatch.setattr(gpu_safety, "HALT_FILE", halt)
+
+    with pytest.raises(RuntimeError, match="does not authorize another GPU submission"):
+        gpu_safety.require_gpu_tests_enabled("native stage gate")
+
+
+def test_positive_last_gate_authorization_allows_one_reviewed_submission(tmp_path, monkeypatch):
+    halt = tmp_path / "halt.json"
+    _write_state(halt, last_minimal_gate={"authorizes_next_gpu_gate": True})
+    monkeypatch.setattr(gpu_safety, "HALT_FILE", halt)
+
+    gpu_safety.require_gpu_tests_enabled("native stage gate")

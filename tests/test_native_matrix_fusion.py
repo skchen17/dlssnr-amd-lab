@@ -23,6 +23,7 @@ def test_profiles_and_unimplemented_modules_fail_closed():
             validate_config(profile,('c64_ffn','c64_attention_bounded','c128_ffn','c128_attention_bounded'),waves)
             validate_config(profile,('c64_ffn_grouped','c64_attention_query','c128_ffn_grouped','c128_attention_query'),waves)
             validate_config(profile,('c256_ffn',),waves)
+            validate_config(profile,('c64_attention_norm','c128_attention_norm','c256_attention_norm','c512_attention_norm'),waves)
             validate_config(profile,('c64_ffn_grouped','c128_ffn_grouped','c256_ffn_grouped'),waves)
             validate_config(profile,('c512_ffn',),waves)
     for args in [('other',('head_ffn',),1),('wmma_fp8',('vit',),1),('reference',('head_ffn',),3)]:
@@ -30,6 +31,9 @@ def test_profiles_and_unimplemented_modules_fail_closed():
     with pytest.raises(ValueError,match='exactly one C32'):
         validate_config('wmma_fp16',('c32_attention_bounded','c32_attention_staged'),2)
     validate_config('wmma_fp8',('c64_ffn_grouped_fp8w','c128_ffn_grouped_fp8w','c256_ffn_grouped_fp8w'),1)
+    validate_config('wmma_fp16',('c64_ffn_grouped_fp8a','c128_ffn_grouped_fp8a','c256_ffn_grouped_fp8a'),1)
+    validate_config('wmma_fp16',('c64_ffn_grouped_fp8a_lib','c128_ffn_grouped_fp8a_lib','c256_ffn_grouped_fp8a_lib'),1)
+    validate_config('wmma_fp16',('c64_ffn_attention_fp8a','c128_ffn_attention_fp8a','c256_ffn_attention_fp8a'),1)
     with pytest.raises(ValueError,match='resident FP8 weights'):
         validate_config('wmma_fp16',('c64_ffn_grouped_fp8w',),1)
 

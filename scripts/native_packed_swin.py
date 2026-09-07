@@ -13,9 +13,9 @@ def gather_packed(packed, width, height, channels, ox, oy):
         raise ValueError('incorrect packed feature size')
     from native_c32_layout_fusion import active_c32_layout,Mapping
     fusion=active_c32_layout()
-    if fusion is not None and channels==32:
+    if fusion is not None and fusion.supports(channels):
         mapping=Mapping(width,height,ox,oy)
-        return fusion.apply(packed,mapping),mapping
+        return fusion.apply(packed,mapping,channels=channels),mapping
     gx, gy = (width - ox + 7) // 8, (height - oy + 7) // 8
     cta = torch.arange(gx * gy, device=packed.device)[:, None]
     cell = torch.arange(4, device=packed.device)[None, :]
@@ -46,8 +46,8 @@ def scatter_packed(values, mapping, width, height):
     from native_c32_layout_fusion import active_c32_layout,Mapping
     if isinstance(mapping,Mapping):
         fusion=active_c32_layout()
-        if fusion is None or channels!=32 or (width,height)!=(mapping.width,mapping.height):raise ValueError('C32 mapping scope mismatch')
-        return fusion.apply(values,mapping,scatter=True)
+        if fusion is None or not fusion.supports(channels) or (width,height)!=(mapping.width,mapping.height):raise ValueError('native mapping scope mismatch')
+        return fusion.apply(values,mapping,scatter=True,channels=channels)
     index, valid = mapping
     physical = torch.arange(16 * channels, device=values.device)
     head, lane, element = physical // 512, physical % 512 // 16, physical % 16
@@ -85,8 +85,14 @@ class RecoveredPackedSwin(nn.Module):
         family=f'c{self.channels}_ffn'
         grouped_family=f'{family}_grouped'
         resident_grouped_family=f'{grouped_family}_fp8w'
-        if matrix is not None and self.channels in (64,128,256) and ({grouped_family,resident_grouped_family}&matrix.modules):
+        resident_activation_family=f'{grouped_family}_fp8a'
+        resident_activation_library_family=f'{grouped_family}_fp8a_lib'
+        resident_attention_family=f'c{self.channels}_ffn_attention_fp8a'
+        if matrix is not None and self.channels in (64,128,256) and ({grouped_family,resident_grouped_family,resident_activation_family,resident_activation_library_family,resident_attention_family}&matrix.modules):
             post=matrix.wide_group_ffn(self,windows)
+            if resident_attention_family in matrix.modules:
+                post,post_fp8=post
+                return matrix.wide_attention_from_fp8(self.block.attention,post,post_fp8)
             attention_family=f'c{self.channels}_attention'
             bounded_family=f'c{self.channels}_attention_bounded'
             query_family=f'c{self.channels}_attention_query'

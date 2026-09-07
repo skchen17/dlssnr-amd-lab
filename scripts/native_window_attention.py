@@ -79,6 +79,16 @@ def window_attention(q, k, v, q_scale, position_bias):
     return (attention.float() + probability[..., 32:].float() @ v[..., 32:, :].float()).half()
 
 
+def window_attention_prepared(q,k,v,position_bias):
+    """Attention after a native Q/K normalization + E4M3 preparation stage."""
+    scores=((native_gemm(q,k.transpose(-1,-2))+position_bias).half() if use_native_fp16() else
+            (q.float()@k.float().transpose(-1,-2)+position_bias.float()).half())
+    probability=quantize_e4(torch.softmax(scores.float(),dim=-1).half())
+    if use_native_fp16():return native_gemm(probability,v)
+    attention=(probability[...,:32].float()@v[...,:32,:].float()).half()
+    return (attention.float()+probability[...,32:].float()@v[...,32:,:].float()).half()
+
+
 class RecoveredWindowAttention(nn.Module):
     native_graph_complete = False
     rtx_quality_verified = False
@@ -132,8 +142,14 @@ class RecoveredWindowAttention(nn.Module):
         if post_ffn.device != self.qkv.device:
             raise ValueError('input and parameters must share the same device')
         projection = self._linear(post_ffn, self.qkv)
-        q, k, v = [t.reshape(-1, 64, self.heads, 32).transpose(1, 2) for t in projection.chunk(3, dim=-1)]
-        value = window_attention(q, k, v, self.q_scale, self.position_bias)
+        from native_matrix_fusion import active_matrix_fusion
+        matrix=active_matrix_fusion();norm_family=f'c{self.channels}_attention_norm'
+        if matrix is not None and norm_family in matrix.modules:
+            q,k,v=matrix.wide_attention_norm(self,projection)
+            value=window_attention_prepared(q,k,v,self.position_bias)
+        else:
+            q, k, v = [t.reshape(-1, 64, self.heads, 32).transpose(1, 2) for t in projection.chunk(3, dim=-1)]
+            value = window_attention(q, k, v, self.q_scale, self.position_bias)
         value = value.transpose(1, 2).reshape(-1, 64, self.channels)
         seed = (post_ffn * self.attention_scale).half()
         return self._linear(value, self.project, seed)

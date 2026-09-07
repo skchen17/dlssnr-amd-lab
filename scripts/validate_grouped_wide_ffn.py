@@ -21,6 +21,13 @@ from gpu_safety import require_gpu_tests_enabled
 from validate_rocm_lifecycle import save, supervise
 
 
+# This is a separate, explicit approximate track.  The activation and mix
+# weights already sit on recovered E4M3 boundaries; the remaining difference
+# is the FP8-WMMA reduction order versus rocBLAS.  Strict-track promotion still
+# requires bitwise equality and this tolerance is never applied to FP16 edges.
+FP8A_TOLERANCE = {'max_absolute_error': 0.001, 'nrmse': 0.0005}
+
+
 def digest(tensor):
     return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest().upper()
 
@@ -99,7 +106,10 @@ def exercise(args, phase):
     with torch.no_grad(), torch.cuda.stream(stream), execution_policy('native_fp16'):
         expected = model.block.ffn(raw[:, model.a_index], raw[:, model.residual_index])
         wait()
-        modules = (f'c{args.channels}_ffn_grouped_fp8w' if args.resident_fp8_weights else f'c{args.channels}_ffn_grouped',)
+        modules = (f'c{args.channels}_ffn_grouped_fp8a_lib' if args.resident_fp8_library_mix else
+                   f'c{args.channels}_ffn_grouped_fp8a' if args.resident_fp8_activations else
+                   f'c{args.channels}_ffn_grouped_fp8w' if args.resident_fp8_weights else
+                   f'c{args.channels}_ffn_grouped',)
         torch.cuda.reset_peak_memory_stats()
         with matrix_fusion(args.dll, args.profile, modules=modules, waves=1) as operator:
             operator.wide_group_ffn(model, raw, output)
@@ -125,22 +135,39 @@ def exercise(args, phase):
                       and (output_guard[:128] == -5.75).all() and (output_guard[-128:] == -5.75).all())
         finite = bool(torch.isfinite(output).all())
         wait()
-    checks = base['bitwise_exact'] and repeat['bitwise_exact'] and changed['bitwise_exact'] and guards and finite
+    tolerance=dict(FP8A_TOLERANCE);approximate=args.resident_fp8_activations or args.resident_fp8_library_mix
+    def accepted(error):
+        return error['bitwise_exact'] or (approximate and
+            error['max_absolute_error']<=tolerance['max_absolute_error'] and
+            error['nrmse'] is not None and error['nrmse']<=tolerance['nrmse'])
+    checks = accepted(base) and repeat['bitwise_exact'] and accepted(changed) and guards and finite
     return {
         'checks_pass': checks,
         'channels': args.channels,
         'windows': args.windows,
         'profile': args.profile,
         'resident_fp8_weights': args.resident_fp8_weights,
-        'resident_fp8_activations': False,
-        'candidate_scope': 'one workgroup per (window,head,16-token tile); 4 KiB local hidden; library CxC mix remains separate',
+        'resident_fp8_activations': args.resident_fp8_activations,
+        'resident_fp8_library_mix': args.resident_fp8_library_mix,
+        'candidate_scope': ('E4M3 grouped activation is resident into ROCm library FP8 GEMM; FP16 residual preserved'
+                            if args.resident_fp8_library_mix else
+                            'E4M3 grouped activation is resident across the two authored kernels; FP8 WMMA CxC mix; FP16 residual preserved'
+                            if args.resident_fp8_activations else
+                            'one workgroup per (window,head,16-token tile); 4 KiB local hidden; library CxC mix remains separate'),
         'grid_workgroups': args.windows * (args.channels // 32) * 4,
         'threads_per_workgroup': 32,
         'static_lds_bytes_per_workgroup': 128 * 16 * 2,
-        'logical_candidate_dispatches': 3,
-        'logical_candidate_stages': ['group_expand_activation_contract_quantize_and_seed', 'library_mix_gemm', 'residual_add'],
+        'logical_candidate_dispatches': 2 if args.resident_fp8_activations else 3,
+        'logical_candidate_stages': (['group_expand_activation_contract_to_resident_e4m3_and_seed','rocm_library_fp8_mix','fp16_residual_add']
+            if args.resident_fp8_library_mix else ['group_expand_activation_contract_to_resident_e4m3_and_seed','fp8_wmma_mix_and_residual_add']
+            if args.resident_fp8_activations else ['group_expand_activation_contract_quantize_and_seed', 'library_mix_gemm', 'residual_add']),
         'custom_kernel_launches_per_call': launches_per_call,
-        'temporary_workspace_bytes': 2 * args.windows * 64 * args.channels * 2,
+        'temporary_workspace_bytes': args.windows*64*args.channels*(3 if approximate else 4),
+        'reference_tolerance': tolerance if approximate else None,
+        'correctness_track': 'explicit_approximate_original_e4m3_boundary_v1' if approximate else 'strict_bitwise',
+        'tolerance_rationale': ('Only the recovered E4M3 grouped activation/mix boundary changes reduction order; '
+                                'FP16 residual remains outside FP8 WMMA.' if approximate else None),
+        'tolerance_used': approximate and not base['bitwise_exact'],
         'reference_gpu_event_ms': reference_times,
         'candidate_gpu_event_ms': candidate_times,
         'reference_median_gpu_event_ms': statistics.median(reference_times),
@@ -191,10 +218,13 @@ def main():
     parser.add_argument('--iterations', type=int, choices=(1, 12), default=1)
     parser.add_argument('--profile', choices=('wmma_fp16', 'wmma_fp8'), default='wmma_fp16')
     parser.add_argument('--resident-fp8-weights', action='store_true')
+    parser.add_argument('--resident-fp8-activations', action='store_true')
+    parser.add_argument('--resident-fp8-library-mix', action='store_true')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--child', action='store_true')
     args = parser.parse_args()
     if args.resident_fp8_weights and args.profile!='wmma_fp8':parser.error('--resident-fp8-weights requires --profile wmma_fp8')
+    if sum(bool(value) for value in (args.resident_fp8_weights,args.resident_fp8_activations,args.resident_fp8_library_mix))>1:parser.error('select one resident prototype')
     require_gpu_tests_enabled('low-LDS grouped wide FFN GPU gate')
     if args.child:
         return child(args)
@@ -203,6 +233,8 @@ def main():
                '--channels', str(args.channels), '--windows', str(args.windows), '--iterations', str(args.iterations),
                '--profile', args.profile, '--output', str(args.output.resolve())]
     if args.resident_fp8_weights:command.append('--resident-fp8-weights')
+    if args.resident_fp8_activations:command.append('--resident-fp8-activations')
+    if args.resident_fp8_library_mix:command.append('--resident-fp8-library-mix')
     return supervise(command, args.output, timeout=120)
 
 

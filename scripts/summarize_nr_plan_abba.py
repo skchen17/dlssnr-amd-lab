@@ -1,5 +1,5 @@
 """Summarize four independent 1080p Python/NRPlan benchmark processes."""
-import argparse,json,statistics
+import argparse,json,math,statistics
 from pathlib import Path
 
 
@@ -12,11 +12,17 @@ def load(root):
         raise ValueError(f'{root}: failed or abnormal process')
     if child['allocated_after_release_bytes'] or child['reserved_after_release_bytes']:
         raise ValueError(f'{root}: resources not released')
+    host=sorted(r['host_forward_submit_wait_ms'] for r in warm)
+    event=sorted(r['gpu_stream_elapsed_ms'] for r in warm)
+    p95=lambda values:values[max(0,math.ceil(.95*len(values))-1)]
     return child,{
         'directory':str(root),'host_median_ms':statistics.median(r['host_forward_submit_wait_ms'] for r in warm),
         'event_median_ms':statistics.median(r['gpu_stream_elapsed_ms'] for r in warm),
+        'host_p95_ms':p95(host),'event_p95_ms':p95(event),
+        'measured_runs':len(child['runs']),'warm_runs':len(warm),
         'output_sha256':warm[0]['output_sha256'],'cpp_nr_plan':warm[0]['cpp_nr_plan'],
         'kernel_nodes':child.get('gpu_dispatch_count'),'graph_nodes':child.get('gpu_graph_nodes'),
+        'cpp_nr_plan_resources':child.get('cpp_nr_plan_resources'),
         'peak_allocated_bytes':max(r['peak_allocated_bytes'] for r in warm),
         'peak_reserved_bytes':max(r['peak_reserved_bytes'] for r in warm),
         'device_used_bytes':max(r['device_used_bytes_sample'] for r in warm)}
@@ -31,8 +37,13 @@ def main():
     if len(hashes)!=1 or len(inputs)!=1:raise ValueError('input or output mismatch')
     a_ms=statistics.mean((rows[0]['host_median_ms'],rows[3]['host_median_ms']))
     b_ms=statistics.mean((rows[1]['host_median_ms'],rows[2]['host_median_ms']))
+    a_p95=statistics.mean((rows[0]['host_p95_ms'],rows[3]['host_p95_ms']))
+    b_p95=statistics.mean((rows[1]['host_p95_ms'],rows[2]['host_p95_ms']))
     report={'schema':1,'checks_pass':True,'order':['A_PYTHON','B_NRPLAN','B_NRPLAN','A_PYTHON'],'rows':rows,
             'a_host_mean_of_medians_ms':a_ms,'b_host_mean_of_medians_ms':b_ms,
+            'a_host_mean_of_p95_ms':a_p95,'b_host_mean_of_p95_ms':b_p95,
+            'a_nr_jobs_per_second':1000/a_ms,'b_nr_jobs_per_second':1000/b_ms,
+            'b_multiple_of_50ms_target':b_ms/50,'b_multiple_of_20ms_target':b_ms/20,
             'nrplan_host_change_percent':(b_ms/a_ms-1)*100,'output_sha256':rows[0]['output_sha256'],
             'event_scope_warning':'Python event spans may exclude host-side gaps/blocking; compare host submit/wait for the runtime A/B. NRPlan event spans are stream elapsed, not kernel-busy sums.',
             'gpu_profiler_used':False}

@@ -248,6 +248,49 @@ extern "C" __declspec(dllexport) int native_fusion_c32_layout(const void* input,
     return int(hipGetLastError());
 }
 
+// Whole-grid packed-cell <-> Swin-window adapter for all recovered image
+// channel families.  A packed image stores one contiguous 16*C cell; a window
+// contains four cells.  The adapter changes only scheduling/layout and never
+// changes a numeric value.  C32 keeps the original export above for ABI
+// compatibility while wider stages opt in through this explicit entry point.
+__global__ static void packed_gather_kernel(const uint16_t* input,uint16_t* out,
+    int width,int height,int channels,int ox,int oy,size_t n) {
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=n)return;
+    size_t window_elements=size_t(64)*channels,cell_elements=size_t(16)*channels;
+    int cta=int(i/window_elements),cell=int((i%window_elements)/cell_elements);
+    size_t local=i%cell_elements;int gx=(width-ox+7)/8;
+    int x=(cta%gx*8+ox)/4+cell%2,y=(cta/gx*8+oy)/4+cell/2;
+    out[i]=(x>=0&&x<width/4&&y>=0&&y<height/4)?
+        input[(size_t(y)*(width/4)+x)*cell_elements+local]:0;
+}
+__global__ static void packed_scatter_kernel(const uint16_t* input,uint16_t* out,
+    int width,int height,int channels,int ox,int oy,size_t n) {
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=n)return;
+    size_t cell_elements=size_t(16)*channels,cell_index=i/cell_elements;
+    int x=int(cell_index%(width/4)),y=int(cell_index/(width/4));
+    int local=int(i%cell_elements),head=local/512,within=local%512;
+    int lane=within/16,e=within%16,tx=x-ox/4,ty=y-oy/4,gx=(width-ox+7)/8;
+    int cta=ty/2*gx+tx/2,cell=(ty%2)*2+tx%2;
+    int row=lane/4+e%8/4*8,col=head*32+lane%4*2+e%4/2*8+e/8*16+(e&1);
+    out[i]=input[(size_t(cta)*64+cell*16+row)*channels+col];
+}
+extern "C" __declspec(dllexport) int native_fusion_packed_layout(const void* input,void* out,
+    int width,int height,int channels,int ox,int oy,int scatter,void* stream) {
+    if(!input||!out||width<=0||height<=0||width%4||height%4||
+       (channels!=32&&channels!=64&&channels!=128&&channels!=256&&channels!=512)||
+       (ox!=0&&ox!=-4)||(oy!=0&&oy!=-4))return int(hipErrorInvalidValue);
+    size_t n=scatter?size_t(width)*height*channels:
+        size_t((width-ox+7)/8)*((height-oy+7)/8)*64*channels;
+    auto hip_stream=reinterpret_cast<hipStream_t>(stream);
+    if(scatter)hipLaunchKernelGGL(packed_scatter_kernel,dim3(unsigned((n+255)/256)),dim3(256),0,
+        hip_stream,static_cast<const uint16_t*>(input),static_cast<uint16_t*>(out),
+        width,height,channels,ox,oy,n);
+    else hipLaunchKernelGGL(packed_gather_kernel,dim3(unsigned((n+255)/256)),dim3(256),0,
+        hip_stream,static_cast<const uint16_t*>(input),static_cast<uint16_t*>(out),
+        width,height,channels,ox,oy,n);
+    return int(hipGetLastError());
+}
+
 // GEMM result boundary: optional half-rounded scaled seed + FP32 product -> half.
 // GEMM accumulation itself remains with the reference library implementation.
 __global__ static void head_add_kernel(const __half* seed,const float* product,const __half* scale,

@@ -2,7 +2,59 @@
 
 Experimental GPU interoperability / reverse-engineering project.
 
-## Latest checkpoint — 2026-09-06
+## Latest checkpoint — 2026-09-07
+
+The native runtime now has a compiled ABI-v3 shape/frame contract, segmented
+model-package verification, one-byte approximate resident arenas, explicit
+D3D12-fence wait/graph/signal submission, and fail-closed temporal/33 ms gates.
+A CPU-only private gfx1201 cache was built for all 71 blocks (1,014 records,
+148,300,672 bytes), preserving non-E4M3 matrices as FP16 and adding verified
+inverse-permutation indexes for native FFN kernels. C32 through C512 plus the
+eight 1024-channel ViT cores now have stage-specific resident-FP8 topology:
+68 record cores, the central C512/ViT transition, and all eight Encoder/Decoder
+scale boundaries now map to a theoretical 506 C++-recorded HIP kernels and five
+D2D skip copies, with no
+PyTorch allocation references. C32 uses a 7-dispatch diagnostic core,
+C64/C128/C256 use 8,
+the four-record C512 split uses 7, and ViT uses five launches with streamed
+global attention (no N-by-N tensor). The current diagnostic arena
+uses an explicit FP16 QKV diagnostic boundary and therefore occupies
+550,736,384 bytes. Pre and Head remain open;
+the 69-record count is not a claim that those record boundaries are mathematically
+complete. This topology
+has not passed its GPU gates and remains disabled. One minimal C256 one-window
+gate passed lifecycle/resource cleanup but failed numerically. The split QKV
+gate proves the matrix projection is close (NRMSE 0.015319, max error 0.011276)
+and the first large divergence occurs while publishing Q/K/V. Deterministic
+pre-submit poison, captured-graph/DOT inspection and raw byte histograms rule out
+allocator residue, a stale kernel and a simple layout permutation. Scalar,
+packed-FP8x2, inlined software encoding, device-symbol LUT, split norm/pack and
+explicit plan-owned LUT publishers have all been rejected: every one produces
+the same decoded-E4M3 FP16 storage bytes in Q/K/V. The latest split publisher is
+an 11-VGPR, 0-LDS, b8-store kernel and its graph dependency is correct, so the
+remaining diagnosis is captured kernel-argument/write-target validation rather
+than another conversion implementation. No candidate is enabled.
+The last accepted complete result remains
+220.061 ms and 4,653 kernels + 59 memcpy, and the 71-block graph still depends
+on the PyTorch capture pool. See
+[the ABI-v3 implementation report](docs/NATIVE_TEMPORAL_ENGINE_V3_20260907.md).
+The resident scale-boundary design and this gate are recorded in
+[the transition report](docs/NATIVE_SCALE_TRANSITION_FP8_20260907.md).
+
+The 1080p selected 71-block graph now uses whole-grid packed layout for
+C32/C64/C128/C256/C512 and low-resource stage-specific QKV normalization for the
+four wide families. A 12-run-per-process B-A-B-A measured **221.930 ms GPU event
+median / 224.348 ms host median**, with **4,653 kernel nodes + 59 memcpy nodes**
+and bitwise-identical output. The stage kernels reduce kernel count by 29.04%
+and GPU span by 3.86% versus the 6,557-kernel wide-layout control; the shared
+Q/K/V arena holds peak allocated memory to 901 MB. A real resident-FP8 C128+C256
+full-frame candidate was deterministic but slightly slower and is not promoted.
+See [the wide-layout/stage/FP8 report](docs/WIDE_LAYOUT_STAGE_FP8_20260907.md).
+This is still not a standalone deployment runtime: the graph
+executable retains pointers into the PyTorch capture pool, and the new ownership
+gate deliberately reports `deployment_ready=false`. The first real C64
+cross-kernel resident-FP8 activation candidate was also rejected for performance.
+See [the census and FP8 report](docs/NATIVE_ENGINE_CENSUS_FP8_20260907.md).
 
 The current delivery track is an original-weight, AMD-native ROCm **single-color
 tensor candidate**, not a complete or quality-verified DLSS5 replacement.

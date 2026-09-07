@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from native_grouped_ffn import cubic_silu
 from native_swin_torch import decode_e4, packed_b, permute32, quantize_e4
-from native_window_attention import projection_indices, window_attention
+from native_window_attention import projection_indices, window_attention, window_attention_prepared
 from native_execution_policy import use_native_fp16, native_gemm
 
 
@@ -118,6 +118,7 @@ class SplitProjection512(nn.Module):
 class SplitAttention512(nn.Module):
     def __init__(self, raw):
         super().__init__()
+        self.channels = 512
         check_record(raw, 'attention')
         parameter(self, 'qkv', decode_e4(raw)[projection_indices(512, 0, qkv=True)])
         halves = torch.frombuffer(bytearray(raw), dtype=torch.float16)
@@ -134,8 +135,14 @@ class SplitAttention512(nn.Module):
     def forward(self, post_ffn):
         require_features(post_ffn, self.qkv.device)
         projected = chunked_linear(post_ffn[..., self.permutation], self.qkv)
-        q, k, v = [x.reshape(-1, 64, 16, 32).transpose(1, 2) for x in projected.chunk(3, -1)]
-        result = window_attention(q, k, v, self.q_scale, self.position_bias)
+        from native_matrix_fusion import active_matrix_fusion
+        matrix = active_matrix_fusion()
+        if matrix is not None and 'c512_attention_norm' in matrix.modules:
+            q, k, v = matrix.wide_attention_norm(self, projected)
+            result = window_attention_prepared(q, k, v, self.position_bias)
+        else:
+            q, k, v = [x.reshape(-1, 64, 16, 32).transpose(1, 2) for x in projected.chunk(3, -1)]
+            result = window_attention(q, k, v, self.q_scale, self.position_bias)
         return quantize_e4(result.transpose(1, 2).reshape(-1, 64, 512))
 
 

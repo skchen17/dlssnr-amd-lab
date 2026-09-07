@@ -87,24 +87,36 @@ def exercise(a,phase):
     color=torch.frombuffer(bytearray(raw),dtype=torch.float16).reshape(h,w,4).cuda()
     if any(t.device.type!='cuda' for t in [color,*model.parameters(),*model.buffers()]):raise RuntimeError('CPU neural tensor')
     wait();phase('model_and_input_ready')
-    runs=[];reference=None
+    runs=[];reference=None;reference_raw=None;candidate_hash=None;approximate_metrics=None
     if a.reference_output:
         refmeta=json.loads((a.reference_output.parent/'input.json').read_bytes())
         if refmeta['sha256']!=meta['sha256'] or refmeta['geometry']!=meta['geometry']:raise ValueError('reference input differs')
-        reference=sha(a.reference_output.read_bytes())
+        reference_raw=a.reference_output.read_bytes();reference=sha(reference_raw)
     grid_families=tuple(filter(None,a.whole_grid_families.split(',')))
-    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv,whole_grid='head' in grid_families) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families),transition_policy(resident=a.resident_transitions,capture_outviews=a.capture_transition_outviews),transition_fusion(a.transition_dll,encoder=a.encoder_transition,decoder=a.decoder_transition) as transitions:
-        plan=None;plan_graph_stats=None
+    layout_channels=tuple(int(value) for value in a.resident_layout_channels.split(','))
+    with torch.no_grad(),execution_policy('native_fp16'),compact_layout(True),fusion_policy(a.fusion_dll) as fused,head_input_fusion(a.head_input_dll,gather=a.head_gather,epilogue=a.head_epilogue,qkv=a.head_qkv,whole_grid='head' in grid_families) as head_fused,pre_features_fusion(a.pre_features_dll,project_pack=a.pre_project_pack) as pre_fused,c32_layout_fusion(a.c32_layout_dll,layout_channels) as c32_fused,matrix_fusion(a.matrix_dll,a.matrix_profile,modules=tuple(a.matrix_modules.split(',')),waves=a.matrix_waves) as matrix,grid_policy(grid_families),transition_policy(resident=a.resident_transitions,capture_outviews=a.capture_transition_outviews),transition_fusion(a.transition_dll,encoder=a.encoder_transition,decoder=a.decoder_transition) as transitions:
+        plan=None;plan_graph_stats=None;plan_resource_stats=None
         if a.cpp_nr_plan_dll:
             from native_cpp_nr_plan import CapturedNRPlan
+            from native_nr_arena import build_arena_plan
             def plan_wait(stream):
                 event=torch.cuda.Event()
                 with torch.cuda.stream(stream):event.record()
                 wait(event)
+            graph_forward=lambda source:model(source,0,window_batch=768,query_chunk=1024)
+            arena_plan=build_arena_plan(w,h)
             plan=CapturedNRPlan(a.cpp_nr_plan_dll,
-                lambda source:model(source,0,window_batch=768,query_chunk=1024),color,
-                wait=plan_wait,lifetimes=(model,fused,head_fused,pre_fused,c32_fused,matrix,transitions))
+                graph_forward,color,
+                wait=plan_wait,lifetimes=(model,fused,head_fused,pre_fused,c32_fused,matrix,transitions),
+                weight_blob=b''.join(records[key] for key in sorted(records)),
+                workspace_bytes=arena_plan['workspace_bytes'],arena_regions=arena_plan['regions'],
+                stage_iterator=(lambda source:model.stages(source,0,window_batch=768,query_chunk=1024)) if a.graph_census else None)
             plan_graph_stats=dict(plan.graph_stats)
+            plan_resource_stats=dict(plan.resource_stats)
+            if a.graph_census:
+                save(a.output/'graph_kernel_nodes.json',{'schema':1,'scope':'raw instantiated HIP Graph kernel census; graph-node order is not execution order',
+                     'nodes':plan.kernel_node_census()})
+                plan.write_debug_dot(a.output/'graph.dot')
             phase('cpp_nr_plan_captured')
         for index in range(a.iterations):
             plan_wait(plan.stream) if plan else wait();torch.cuda.reset_peak_memory_stats()
@@ -120,15 +132,32 @@ def exercise(a,phase):
             finite=torch.isfinite(value).all();wait()
             if not bool(finite):raise RuntimeError('nonfinite output')
             out=value.cpu().numpy().tobytes()
-            if reference is None:reference=sha(out)
+            digest=sha(out)
+            if reference is None:reference=digest
+            if a.allow_approximate_output:
+                if candidate_hash is None:
+                    candidate_hash=digest
+                    actual_half=torch.frombuffer(bytearray(out),dtype=torch.float16)
+                    reference_half=torch.frombuffer(bytearray(reference_raw),dtype=torch.float16)
+                    actual_cpu=actual_half.float();reference_cpu=reference_half.float()
+                    delta=actual_cpu-reference_cpu;rmse=float(delta.square().mean().sqrt())
+                    denominator=float(reference_cpu.square().mean().sqrt())
+                    unequal=actual_half.view(torch.int16)!=reference_half.view(torch.int16)
+                    approximate_metrics={'bitwise_exact':not bool(unequal.any()),
+                        'different_components':int(unequal.sum()),
+                        'different_fraction':float(unequal.float().mean()),
+                        'max_absolute_error':float(delta.abs().max()),'rmse':rmse,
+                        'nrmse':rmse/denominator if denominator else (0.0 if rmse==0 else None)}
+                    del actual_half,reference_half,actual_cpu,reference_cpu,delta,unequal
+                elif digest!=candidate_hash:raise RuntimeError('approximate candidate is not deterministic; stop')
             if index==0:
                 with (a.output/'output.rgba16f').open('xb') as f:f.write(out)
-            if sha(out)!=reference:raise RuntimeError('same input changed output; stop')
+            if not a.allow_approximate_output and digest!=reference:raise RuntimeError('same input changed output; stop')
             free,total=torch.cuda.mem_get_info()
             item={'index':index,'warm':index>0,'host_forward_submit_wait_ms':host,'gpu_event_raw_ms':event_ms,
                   'gpu_stream_elapsed_ms':event_ms if clock_ok and math.isfinite(event_ms) and 0<event_ms<=host*1.25 else None,
                   'peak_allocated_bytes':torch.cuda.max_memory_allocated(),'peak_reserved_bytes':torch.cuda.max_memory_reserved(),
-                  'device_used_bytes_sample':total-free,'output_sha256':reference}
+                  'device_used_bytes_sample':total-free,'output_sha256':digest}
             item['cpp_nr_plan']=bool(plan)
             item['cpp_nr_plan_sequence']=plan.sequence if plan else 0
             item['authored_fusions_cumulative']=fused.counts() if fused else None
@@ -142,7 +171,8 @@ def exercise(a,phase):
             item['grouped_ffn_logical_dispatches_cumulative']=matrix.grouped_ffn_logical_dispatches if matrix else 0
             item['pre_features_launches_cumulative']=pre_fused.launches if pre_fused else 0
             item['pre_project_pack_launches_cumulative']=pre_fused.project_pack_launches if pre_fused else 0
-            item['c32_layout_launches_cumulative']={'gather':c32_fused.gather_calls,'scatter':c32_fused.scatter_calls} if c32_fused else None
+            item['c32_layout_launches_cumulative']={'gather':c32_fused.gather_calls,'scatter':c32_fused.scatter_calls,
+                'by_channel':c32_fused.calls_by_channel} if c32_fused else None
             item['transition_counts_cumulative']=transitions.counts() if transitions else None
             if item['peak_reserved_bytes']>5000000000 or total-free>6000000000:raise RuntimeError('memory envelope exceeded')
             runs.append(item)
@@ -166,7 +196,7 @@ def exercise(a,phase):
                     drained.append({'repeat':repeat,'block':b,'host_submit_wait_ms':wall,
                         'peak_allocated_bytes':torch.cuda.max_memory_allocated(),
                         'peak_reserved_bytes':torch.cuda.max_memory_reserved()})
-                if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('drained pass differs')
+                if sha(value.cpu().numpy().tobytes())!=(candidate_hash or reference):raise RuntimeError('drained pass differs')
                 del iterator,value
                 phase(f'drained_pass{repeat}_validated')
             save(a.output/'drained_stages.json',{'scope':'isolated stage submit/wait; perturbs scheduling; NOT GPU busy time or additive forward time',
@@ -186,7 +216,7 @@ def exercise(a,phase):
                 after=fused.counts() if fused else {}
                 for _,value in iterator:pass
                 wait()
-                if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('isolated module output differs')
+                if sha(value.cpu().numpy().tobytes())!=(candidate_hash or reference):raise RuntimeError('isolated module output differs')
                 head_runs.append({'host_submit_wait_ms':wall,'gpu_stream_ms':event,
                     'gpu_event_accepted_for_module_cost':False,
                     'gpu_event_note':'Driver event spans can omit host submission gaps; use drained host submit/wait for module cost',
@@ -208,7 +238,7 @@ def exercise(a,phase):
                 except StopIteration:pass
                 else:raise RuntimeError('extra stage')
             wait()
-            if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('instrumentation changed output')
+            if sha(value.cpu().numpy().tobytes())!=(candidate_hash or reference):raise RuntimeError('instrumentation changed output')
             save(a.output/'aten_counts.json',counter.report());del iterator,value
             phase('instrumented_run_validated')
         if a.stage_timestamps:
@@ -223,7 +253,7 @@ def exercise(a,phase):
             except StopIteration:pass
             else:raise RuntimeError('extra timestamp stage')
             wait();pass_wall=(time.perf_counter()-pass_start)*1000
-            if sha(value.cpu().numpy().tobytes())!=reference:raise RuntimeError('timestamp pass changed output')
+            if sha(value.cpu().numpy().tobytes())!=(candidate_hash or reference):raise RuntimeError('timestamp pass changed output')
             stage_times=[{'block':b,'gpu_stream_interval_ms':begin.elapsed_time(end),'host_stage_submit_ms':submits[b]} for b,begin,end in events]
             whole=events[0][1].elapsed_time(events[-1][2])
             gaps=[{'before_block':events[i][0],'gpu_stream_gap_ms':events[i-1][2].elapsed_time(events[i][1])} for i in range(1,len(events))]
@@ -239,6 +269,7 @@ def exercise(a,phase):
             'host_warm_median_ms':statistics.median(r['host_forward_submit_wait_ms'] for r in runs[1:]) if len(runs)>1 else None,
             'gpu_dispatch_count':plan_graph_stats['kernel_nodes'] if plan_graph_stats else None,
             'gpu_graph_nodes':plan_graph_stats,'gpu_busy_kernel_sum_ms':None,'gpu_profiler_available':False,
+            'cpp_nr_plan_resources':plan_resource_stats,
             'fusion_dll_sha256':sha(a.fusion_dll.read_bytes()) if a.fusion_dll else None,
             'head_input_dll_sha256':sha(a.head_input_dll.read_bytes()) if a.head_input_dll else None,
             'matrix_dll_sha256':sha(a.matrix_dll.read_bytes()) if a.matrix_dll else None,
@@ -255,7 +286,10 @@ def exercise(a,phase):
             'encoder_transition':a.encoder_transition,
             'decoder_transition':a.decoder_transition,
             'c32_layout_dll_sha256':sha(a.c32_layout_dll.read_bytes()) if a.c32_layout_dll else None,
+            'resident_layout_channels':list(layout_channels) if a.c32_layout_dll else [],
             'reference_output_sha256':sha(a.reference_output.read_bytes()) if a.reference_output else None,
+            'accuracy_track':'approximate_deterministic' if a.allow_approximate_output else 'strict_hash',
+            'approximate_output_metrics':approximate_metrics,
             'timing_scope':'Full-forward host submit/wait excludes finite checks and image readback; event span includes stream idle gaps and is not kernel busy sum',
             'fsr_applied':False,'rtx_quality_accepted':False,'temporal_quality_accepted':False,'game_runtime_ready':False}
 
@@ -293,9 +327,11 @@ if __name__=='__main__':
     p.add_argument('--head-input-dll',type=Path)
     p.add_argument('--matrix-dll',type=Path)
     p.add_argument('--matrix-profile',choices=('reference','wmma_fp16','wmma_fp8'),default='reference')
+    p.add_argument('--allow-approximate-output',action='store_true',help='explicit research track: require finite deterministic output and report error versus the same-input reference instead of requiring an equal hash')
     p.add_argument('--matrix-waves',type=int,choices=(1,2,4),default=1)
     p.add_argument('--matrix-modules',default='head_ffn',help='comma-separated reviewed module names; policy rejects unknown values')
     p.add_argument('--cpp-nr-plan-dll',type=Path)
+    p.add_argument('--graph-census',action='store_true')
     p.add_argument('--measure-head',action='store_true')
     p.add_argument('--head-gather',action='store_true')
     p.add_argument('--head-weight-cache',action='store_true')
@@ -305,6 +341,7 @@ if __name__=='__main__':
     p.add_argument('--pre-project-pack',action='store_true')
     p.add_argument('--whole-grid-families',default='',help='comma-separated reviewed families such as pre,c32')
     p.add_argument('--c32-layout-dll',type=Path)
+    p.add_argument('--resident-layout-channels',default='32',help='explicit comma-separated packed-layout families; default preserves historical C32-only behavior')
     p.add_argument('--resident-transitions',action='store_true')
     p.add_argument('--capture-transition-outviews',action='store_true')
     p.add_argument('--transition-dll',type=Path)
@@ -320,12 +357,19 @@ if __name__=='__main__':
     if a.pre_features_dll and not a.reference_output:p.error('pre fusion requires same-input reference')
     if a.pre_project_pack and not a.pre_features_dll:p.error('pre project/pack requires --pre-features-dll')
     if a.c32_layout_dll and not a.reference_output:p.error('C32 fusion requires same-input reference')
+    try:layout_channels=tuple(int(value) for value in a.resident_layout_channels.split(','))
+    except ValueError:p.error('resident layout channels must be comma-separated integers')
+    if not layout_channels or set(layout_channels)-{32,64,128,256,512}:p.error('unsupported resident layout channel family')
+    if set(layout_channels)-{32} and not a.c32_layout_dll:p.error('wide resident layouts require --c32-layout-dll')
     if a.capture_transition_outviews and not a.resident_transitions:p.error('transition outview capture requires resident transitions')
     if a.encoder_transition and (not a.transition_dll or not a.resident_transitions or not a.reference_output):p.error('encoder transition requires DLL, resident routing, and same-input reference')
     if a.decoder_transition and (not a.transition_dll or not a.resident_transitions or not a.reference_output):p.error('decoder transition requires DLL, resident routing, and same-input reference')
     if a.transition_dll and not (a.encoder_transition or a.decoder_transition):p.error('transition DLL requires an explicit transition selection')
     if a.matrix_profile!='reference' and (not a.matrix_dll or not a.reference_output):p.error('matrix candidate requires DLL and explicit reference')
+    if a.allow_approximate_output and not a.reference_output:p.error('approximate output reporting requires a same-input reference')
     if a.cpp_nr_plan_dll and (a.count_operators or a.stage_timestamps or a.drain_stages or a.measure_head):p.error('NRPlan timing cannot be mixed with diagnostic reruns')
+    if a.graph_census and not a.cpp_nr_plan_dll:p.error('graph census requires --cpp-nr-plan-dll')
+    if a.graph_census and a.iterations!=1:p.error('graph census is a one-frame diagnostic, not a performance loop')
     if a.child:raise SystemExit(0 if child(a) else 2)
     a.output.mkdir(parents=True,exist_ok=False);fixture(a.output,a.size)
     command=[sys.executable,str(Path(__file__).resolve()),'--child','--output',str(a.output.resolve()),'--size',a.size,'--iterations',str(a.iterations)]
@@ -335,7 +379,9 @@ if __name__=='__main__':
     if a.fusion_dll:command+=['--fusion-dll',str(a.fusion_dll.resolve())]
     if a.head_input_dll:command+=['--head-input-dll',str(a.head_input_dll.resolve())]
     if a.matrix_dll:command+=['--matrix-dll',str(a.matrix_dll.resolve())]
+    if a.allow_approximate_output:command.append('--allow-approximate-output')
     if a.cpp_nr_plan_dll:command+=['--cpp-nr-plan-dll',str(a.cpp_nr_plan_dll.resolve())]
+    if a.graph_census:command.append('--graph-census')
     command+=['--matrix-profile',a.matrix_profile,'--matrix-waves',str(a.matrix_waves),'--matrix-modules',a.matrix_modules]
     if a.measure_head:command+=['--measure-head']
     command+=['--measure-block',str(a.measure_block)]
@@ -346,7 +392,7 @@ if __name__=='__main__':
     if a.pre_features_dll:command+=['--pre-features-dll',str(a.pre_features_dll.resolve())]
     if a.pre_project_pack:command.append('--pre-project-pack')
     if a.whole_grid_families:command+=['--whole-grid-families',a.whole_grid_families]
-    if a.c32_layout_dll:command+=['--c32-layout-dll',str(a.c32_layout_dll.resolve())]
+    if a.c32_layout_dll:command+=['--c32-layout-dll',str(a.c32_layout_dll.resolve()),'--resident-layout-channels',a.resident_layout_channels]
     if a.resident_transitions:command.append('--resident-transitions')
     if a.capture_transition_outviews:command.append('--capture-transition-outviews')
     if a.transition_dll:command+=['--transition-dll',str(a.transition_dll.resolve())]

@@ -40,3 +40,14 @@ def test_allocator_aware_capture_is_instantiated_by_native_plan():
     assert 'hipGraphInstantiate' in runtime
     assert 'owns_graph' in runtime
     assert 'nrPlanGetGraphStats' in runtime
+
+
+def test_native_plan_exposes_read_only_captured_argument_audit():
+    header=(ROOT/'tools/native_nr_plan/nr_plan.h').read_text(encoding='utf-8')
+    runtime=(ROOT/'tools/native_nr_plan/nr_plan.cpp').read_text(encoding='utf-8')
+    assert 'nrPlanDebugGetKernelU64Arguments' in header
+    assert 'nrPlanDebugGetOwnedAddresses' in header
+    audit=runtime.split('nrPlanDebugGetKernelU64Arguments',1)[1].split(
+        'nrPlanDebugGetOwnedAddresses',1)[0]
+    assert 'hipGraphKernelNodeGetParams' in audit
+    assert 'hipGraphLaunch' not in audit
