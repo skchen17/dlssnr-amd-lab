@@ -71,13 +71,27 @@ D3D12/ROCm cross-process 640×360 alternating-input tests also pass.
 See [latest optimization and commands](docs/NATIVE_OPT3.md),
 [status](docs/STATUS.md), and [native route](docs/ROCM_NATIVE_IMPLEMENTATION.md).
 
-This repository publishes source, tests and research documentation only. Original
-weights, teacher sequences, captures, game images, generated binaries and new raw
-experiment reports remain local/private. Historical document links to `results/`
-identify local evidence and are not all downloadable from GitHub. Reproduction
-requiring those assets needs separately provisioned local files; a source checkout
-alone is not a ready-to-run game plugin. Recorded test results were obtained in
-the documented local environment, not a clean checkout lacking private fixtures.
+This repository publishes source, tests and research documentation. Original
+weights, teacher sequences, proprietary captures, game images and generated
+binaries remain local/private. Historical document links to `results/` identify
+local evidence and are not all downloadable from GitHub. Reproduction requiring
+those assets needs separately provisioned local files; a source checkout alone is
+not a ready-to-run game plugin. Recorded test results were obtained in the
+documented local environment, not a clean checkout lacking private fixtures.
+
+A sanitized public experiment-data snapshot is available from the
+[2026-09-07 data release](https://github.com/skchen17/dlssnr-amd-lab/releases/tag/experiment-data-20260907):
+
+- `dlssnr-amd-lab-experiment-evidence-20260907.tar.gz` contains 12,933 JSON,
+  JSONL, CSV, log and other text evidence files. SHA-256:
+  `6FD5C62AEBE25B49D6DF47390E6B602604244378D63576A5017D821AB637A40D`.
+- `dlssnr-amd-lab-correctness-samples-20260907.tar.gz` contains representative
+  1080p strict/approximate input-output tensors and the C256 FP8 diagnostic
+  samples. SHA-256:
+  `BB9948D0FAB8577857C8FEA35356D476D2FA06F31E28098550923744B7FA3000`.
+
+The release excludes NVIDIA DLL/PTX files, extracted weights and model arenas,
+game captures, generated executables and build products.
 Fetch the pinned public NVAPI dependency with `git submodule update --init third_party/nvapi`.
 For the read-only teacher environment probe, pass your own SSH host explicitly:
 `python scripts/probe_teacher_server.py --host YOUR_SSH_ALIAS --output results/teacher_probe_NEW.json`.
