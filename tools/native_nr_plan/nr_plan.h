@@ -19,6 +19,11 @@ enum NRPrecisionProfile : uint32_t {
     NR_PRECISION_APPROX_FP8 = 1,
 };
 
+enum NRExecutionMode : uint32_t {
+    NR_EXECUTION_GRAPH_REPLAY = 0,
+    NR_EXECUTION_FIXED_SEQUENCE = 1,
+};
+
 enum NRColorMode : uint32_t {
     NR_COLOR_SDR_LINEAR = 0,
     NR_COLOR_HDR_LINEAR = 1,
@@ -334,6 +339,59 @@ struct NRApproxScaleTransitionDesc {
     uint64_t skip_scale_weight_offset;
 };
 
+// Single-color/reset Pre edge. The dynamic color pointer and frame id are read
+// from the device-resident ABI-v3 binding table. All other values are immutable
+// graph parameters copied into NRPlan during initialization.
+struct NRApproxPreDesc {
+    uint32_t struct_size;
+    uint32_t padded_width;
+    uint32_t padded_height;
+    uint32_t windows;
+    float color_scale;
+    uint32_t frame_seed_xor;
+    float conditioning[5];
+    uint32_t reserved;
+    uint64_t input_project_weight_offset;
+    uint64_t ffn_expand_weight_offset;
+    uint64_t ffn_contract_weight_offset;
+    uint64_t ffn_scale_weight_offset;
+    uint64_t a_index_weight_offset;
+    uint64_t residual_index_weight_offset;
+    uint64_t ffn_permutation_weight_offset;
+    uint64_t ffn_inverse_permutation_weight_offset;
+    uint64_t qkv_weight_offset;
+    uint64_t qscale_weight_offset;
+    uint64_t permutation_weight_offset;
+    uint64_t position_bias_weight_offset;
+    uint64_t project_weight_offset;
+    uint64_t residual_scale_weight_offset;
+};
+
+// Record-70 Output Head consumes the final half-resolution C32 resident image
+// plus the retained full-resolution Pre skip and writes the residual directly
+// through the ABI-v3 dynamic output pointer.
+struct NRApproxHeadDesc {
+    uint32_t struct_size;
+    uint32_t padded_width;
+    uint32_t padded_height;
+    uint32_t windows;
+    uint64_t main_scale_weight_offset;
+    uint64_t skip_scale_weight_offset;
+    uint64_t tail_weight_offset;
+    uint64_t ffn_expand_weight_offset;
+    uint64_t ffn_contract_weight_offset;
+    uint64_t ffn_scale_weight_offset;
+    uint64_t a_index_weight_offset;
+    uint64_t residual_index_weight_offset;
+    uint64_t ffn_permutation_weight_offset;
+    uint64_t qkv_weight_offset;
+    uint64_t qscale_weight_offset;
+    uint64_t permutation_weight_offset;
+    uint64_t position_bias_weight_offset;
+    uint64_t project_weight_offset;
+    uint64_t residual_scale_weight_offset;
+};
+
 struct NRPlanPerformanceStats {
     uint64_t submitted_frames;
     uint64_t completed_frames;
@@ -384,6 +442,8 @@ NRPLAN_API hipError_t nrPlanSetRecorderV3(NRPlan* plan, NRPlanRecordFnV3 record,
     void* user);
 NRPLAN_API hipError_t nrPlanSetPrecisionProfile(NRPlan* plan,
     NRPrecisionProfile profile);
+NRPLAN_API hipError_t nrPlanSetExecutionMode(NRPlan* plan,
+    NRExecutionMode mode);
 NRPLAN_API hipError_t nrPlanPrepareShape(NRPlan* plan,
     const NRShapeDesc* shape);
 NRPLAN_API hipError_t nrPlanGetStream(NRPlan* plan, hipStream_t* out_stream);
@@ -406,6 +466,34 @@ NRPLAN_API hipError_t nrPlanDebugGetKernelU64Arguments(NRPlan* plan,
     uint64_t kernel_ordinal, uint32_t argument_count, uint64_t* out_arguments);
 NRPLAN_API hipError_t nrPlanDebugGetOwnedAddresses(NRPlan* plan,
     uint64_t* out_workspace, uint64_t* out_weights, uint64_t* out_stage_e4_lut);
+NRPLAN_API hipError_t nrPlanDebugCopyStageE4LutToDevice(NRPlan* plan,
+    void* device_target, uint64_t bytes);
+NRPLAN_API hipError_t nrPlanDebugStopAfterStandardQkv(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanDebugGetExecutionState(NRPlan* plan,
+    uint32_t* mode, uint64_t* fixed_sequence_submits);
+NRPLAN_API hipError_t nrPlanDebugSetFixedHostBoundaries(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanDebugGetFixedBoundaryState(NRPlan* plan,
+    uint64_t* stage_entries, uint64_t* post_copies, uint64_t* qkv_copies,
+    uint64_t* scratch_bytes);
+NRPLAN_API hipError_t nrPlanDebugCopyFixedBoundaryScratchToDevice(NRPlan* plan,
+    uint64_t offset, void* device_target, uint64_t bytes);
+// Minimal non-deployment bring-up for one resident encoder boundary.  The
+// production API below continues to require all eight scale transitions.
+NRPLAN_API hipError_t nrPlanDebugConfigureApproxEncoderTransition(NRPlan* plan,
+    const NRApproxScaleTransitionDesc* descriptor);
+NRPLAN_API hipError_t nrPlanDebugAppendApproxDecoderTransition(NRPlan* plan,
+    const NRApproxScaleTransitionDesc* descriptor);
+NRPLAN_API hipError_t nrPlanDebugGetFixedTransitionState(NRPlan* plan,
+    uint64_t* encoder_chains, uint64_t* decoder_chains,
+    uint64_t* target_bytes, uint64_t* skip_pool_bytes);
+NRPLAN_API hipError_t nrPlanDebugGetFixedCentralState(NRPlan* plan,
+    uint64_t* encoder_chains, uint64_t* vit_block_chains,
+    uint64_t* decoder_chains, uint64_t* vit_scratch_bytes,
+    uint64_t* bottleneck_skip_bytes);
+NRPLAN_API hipError_t nrPlanDebugCopyFixedResidentToDevice(NRPlan* plan,
+    void* target, uint64_t bytes);
 // Census-only marker. It is never present in the deploy/performance graph.
 NRPLAN_API hipError_t nrPlanRecordStageMarker(hipStream_t stream,
     uint32_t stage_boundary, uint32_t* device_scratch);
@@ -427,6 +515,22 @@ NRPLAN_API hipError_t nrPlanConfigureApproxBottleneck(NRPlan* plan,
     const NRApproxBottleneckDesc* descriptor);
 NRPLAN_API hipError_t nrPlanConfigureApproxScaleTransitions(NRPlan* plan,
     const NRApproxScaleTransitionDesc* descriptors, uint32_t count);
+NRPLAN_API hipError_t nrPlanConfigureApproxPre(NRPlan* plan,
+    const NRApproxPreDesc* descriptor);
+NRPLAN_API hipError_t nrPlanConfigureApproxHead(NRPlan* plan,
+    const NRApproxHeadDesc* descriptor);
+// Opt-in edge experiment. The default preserves three independent Q/K/V
+// publisher kernels; enabled mode combines only those uniform 32-bit stores.
+NRPLAN_API hipError_t nrPlanSetApproxEdgeCompactQkv(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanSetApproxStandardCompactQkv(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanSetApproxFullFusedQkv(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanSetApproxFusedQkvConsumesFp16(NRPlan* plan,
+    uint8_t enabled);
+NRPLAN_API hipError_t nrPlanSetApproxElideRedundantPostPublish(NRPlan* plan,
+    uint8_t enabled);
 // Isolated correctness-gate helpers. They are synchronous by design and must
 // never appear in the per-frame game path or performance measurements.
 NRPLAN_API hipError_t nrPlanInitializeArenaFromDevice(NRPlan* plan,

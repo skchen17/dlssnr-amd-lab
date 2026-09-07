@@ -19,9 +19,9 @@ def test_real_partial_topologies_cover_exactly_c32_through_vit():
                    json.loads((root / 'bottleneck_topology.json').read_text()),
                    transitions)
     assert result['native_block_count'] == 69
-    assert result['theoretical_graph_kernel_nodes'] == 418
+    assert result['conceptual_launch_count_not_graph_nodes'] == 418
     assert result['theoretical_graph_memcpy_nodes'] == 5
-    assert result['remaining_kernel_node_budget'] == 94
+    assert result['kernel_node_budget_evaluated'] is False
     assert result['missing_by_family'] == {
         'Pre': [0], 'Head': [70],
     }

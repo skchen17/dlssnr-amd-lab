@@ -29,13 +29,15 @@ $split = Join-Path $OutputDirectory 'split512_topology.json'
 $vit = Join-Path $OutputDirectory 'vit_topology.json'
 $bottleneck = Join-Path $OutputDirectory 'bottleneck_topology.json'
 $transitions = Join-Path $OutputDirectory 'transition_topology.json'
+$edges = Join-Path $OutputDirectory 'edge_topology.json'
 & $python (Join-Path $repo 'scripts\native_nr_arena.py') --width 1920 --height 1080 --precision-profile approx_fp8 --output $arena
 & $python (Join-Path $repo 'scripts\build_native_stage_topology.py') --weights $WeightCache --arena $arena --model $Model --output $wide
 & $python (Join-Path $repo 'scripts\build_native_split512_topology.py') --weights $WeightCache --arena $arena --model $Model --output $split
 & $python (Join-Path $repo 'scripts\build_native_vit_topology.py') --weights $WeightCache --arena $arena --output $vit
 & $python (Join-Path $repo 'scripts\build_native_bottleneck_topology.py') --weights $WeightCache --arena $arena --output $bottleneck
 & $python (Join-Path $repo 'scripts\build_native_transition_topology.py') --weights $WeightCache --arena $arena --wide $wide --output $transitions
-& $python (Join-Path $repo 'scripts\audit_native_topology_coverage.py') --wide $wide --split512 $split --vit $vit --bottleneck $bottleneck --transitions $transitions --output (Join-Path $OutputDirectory 'topology_coverage.json')
+& $python (Join-Path $repo 'scripts\build_native_edge_topology.py') --weights $WeightCache --model $Model --output $edges
+& $python (Join-Path $repo 'scripts\audit_native_topology_coverage.py') --wide $wide --split512 $split --vit $vit --bottleneck $bottleneck --transitions $transitions --edges $edges --output (Join-Path $OutputDirectory 'topology_coverage.json')
 if ($LASTEXITCODE) { throw 'native NRPlan CPU topology generation failed' }
 
 [ordered]@{

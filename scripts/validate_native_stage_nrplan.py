@@ -32,6 +32,34 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
 
 
+def e4_host_round_shift(value: int, shift: int) -> int:
+    base = value >> shift
+    remainder = value & ((1 << shift) - 1)
+    halfway = 1 << (shift - 1)
+    return base + int(remainder > halfway or
+                      (remainder == halfway and bool(base & 1)))
+
+
+def e4_host_from_half_bits(bits: int) -> int:
+    sign = (bits >> 8) & 0x80
+    exponent = (bits >> 10) & 31
+    mantissa = bits & 1023
+    if exponent == 31 and mantissa:
+        return 0x7f
+    if exponent < 9:
+        code = min(e4_host_round_shift(1024 + mantissa, 16 - exponent), 8)
+    else:
+        rounded = e4_host_round_shift(mantissa, 7)
+        carry = rounded >= 8
+        code = ((exponent - 8 + int(carry)) << 3) | (0 if carry else rounded)
+        code = min(code, 0x7e)
+    return sign | code
+
+
+def expected_e4_lut() -> bytes:
+    return bytes(e4_host_from_half_bits(bits) for bits in range(65536))
+
+
 def preflight(args) -> tuple[dict, dict, dict]:
     dll = args.dll.resolve()
     build_path = dll.parent / 'build.json'
@@ -72,7 +100,9 @@ def preflight(args) -> tuple[dict, dict, dict]:
         'channels': block['channels'],
         'gate_feature_geometry': [8, 8],
         'gate_windows': 1,
-        'expected_graph_kernel_nodes': 7 if block['channels'] == 32 else 8,
+        'expected_graph_kernel_nodes': ((6 if block['channels'] == 32 else 8)
+                                        if getattr(args, 'stop_after_qkv', False)
+                                        else (9 if block['channels'] == 32 else 11)),
         'ctypes_layouts': validate_v3_layouts(),
         'complete_native_topology': False,
         'runtime_accepted': False,
@@ -84,6 +114,10 @@ def preflight(args) -> tuple[dict, dict, dict]:
 def bind(library) -> None:
     library.nrPlanCreate.argtypes = [ct.POINTER(Desc), ct.POINTER(ct.c_void_p)]
     library.nrPlanSetPrecisionProfile.argtypes = [ct.c_void_p, ct.c_uint32]
+    library.nrPlanSetExecutionMode.argtypes = [ct.c_void_p, ct.c_uint32]
+    library.nrPlanDebugGetExecutionState.argtypes = [ct.c_void_p,
+        ct.POINTER(ct.c_uint32), ct.POINTER(ct.c_uint64)]
+    library.nrPlanGetStream.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p)]
     library.nrPlanLoadModelPackage.argtypes = [ct.c_void_p, ct.c_char_p,
                                                ct.POINTER(ModelPackageStats)]
     library.nrPlanConfigureArena.argtypes = [ct.c_void_p, ct.POINTER(ArenaRegion),
@@ -108,17 +142,42 @@ def bind(library) -> None:
     library.nrPlanDebugGetOwnedAddresses.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64),
                                                       ct.POINTER(ct.c_uint64),
                                                       ct.POINTER(ct.c_uint64)]
+    library.nrPlanDebugCopyStageE4LutToDevice.argtypes = [ct.c_void_p, ct.c_void_p,
+                                                           ct.c_uint64]
+    library.nrPlanDebugStopAfterStandardQkv.argtypes = [ct.c_void_p, ct.c_uint8]
+    library.nrPlanDebugGetFixedBoundaryState.argtypes = [ct.c_void_p,
+        ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64),
+        ct.POINTER(ct.c_uint64)]
+    library.nrPlanDebugCopyFixedBoundaryScratchToDevice.argtypes = [ct.c_void_p,
+        ct.c_uint64, ct.c_void_p, ct.c_uint64]
+    library.nr_stage_debug_pack_e4x4_c256.argtypes = [ct.c_void_p, ct.c_void_p,
+                                                       ct.c_void_p, ct.c_uint64,
+                                                       ct.c_int, ct.c_void_p]
+    library.nr_stage_debug_pack_e4x4_from_fp16.argtypes = [ct.c_void_p, ct.c_void_p,
+        ct.c_void_p, ct.c_uint64, ct.c_void_p]
+    library.nr_stage_c256_qkv_norm_fp8.argtypes = [ct.c_void_p, ct.c_void_p,
+        ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p,
+        ct.c_void_p, ct.c_void_p, ct.c_int, ct.c_void_p]
     library.nrPlanGetResourceStats.argtypes = [ct.c_void_p, ct.POINTER(ResourceStats)]
     library.nrPlanGetPerformanceStats.argtypes = [ct.c_void_p,
                                                   ct.POINTER(PerformanceStats)]
     library.nrPlanDestroy.argtypes = [ct.c_void_p]
-    for name in ('nrPlanCreate', 'nrPlanSetPrecisionProfile', 'nrPlanLoadModelPackage',
+    for name in ('nrPlanCreate', 'nrPlanSetPrecisionProfile', 'nrPlanSetExecutionMode',
+                 'nrPlanDebugGetExecutionState',
+                 'nrPlanGetStream', 'nrPlanLoadModelPackage',
                  'nrPlanConfigureArena', 'nrPlanPrepareShape',
                  'nrPlanConfigureApproxStageBlocks', 'nrPlanInitializeArenaFromDevice',
                  'nrPlanFinalize', 'nrPlanSubmitV3', 'nrPlanDebugCopyArenaToDevice',
-                 'nrPlanGetGraphStats', 'nrPlanGetKernelNodeInfos',
-                 'nrPlanDebugDotPrint', 'nrPlanDebugGetKernelU64Arguments',
-                 'nrPlanDebugGetOwnedAddresses', 'nrPlanGetResourceStats',
+                  'nrPlanGetGraphStats', 'nrPlanGetKernelNodeInfos',
+                  'nrPlanDebugDotPrint', 'nrPlanDebugGetKernelU64Arguments',
+                  'nrPlanDebugGetOwnedAddresses', 'nrPlanDebugCopyStageE4LutToDevice',
+                  'nrPlanDebugStopAfterStandardQkv',
+                   'nrPlanDebugGetFixedBoundaryState',
+                   'nrPlanDebugCopyFixedBoundaryScratchToDevice',
+                  'nr_stage_debug_pack_e4x4_c256',
+                  'nr_stage_debug_pack_e4x4_from_fp16',
+                  'nr_stage_c256_qkv_norm_fp8',
+                  'nrPlanGetResourceStats',
                  'nrPlanGetPerformanceStats', 'nrPlanDestroy'):
         getattr(library, name).restype = ct.c_int
 
@@ -134,14 +193,16 @@ def metric(actual, expected) -> dict:
     expected_f = expected.view(torch.float8_e4m3fn).half().float()
     delta = actual_f - expected_f
     denominator = expected_f.square().mean().sqrt()
+    finite = bool(torch.isfinite(actual_f).all() and torch.isfinite(expected_f).all())
     actual_raw = actual.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     expected_raw = expected.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return {
         'byte_exact': bool(torch.equal(actual, expected)),
         'different_bytes': int((actual != expected).sum()),
-        'max_absolute_error': float(delta.abs().max()),
-        'nrmse': float(delta.square().mean().sqrt() / denominator.clamp_min(1e-8)),
-        'finite': bool(torch.isfinite(actual_f).all()),
+        'max_absolute_error': float(delta.abs().max()) if finite else None,
+        'nrmse': float(delta.square().mean().sqrt() /
+                       denominator.clamp_min(1e-8)) if finite else None,
+        'finite': finite,
         'actual_sha256': hashlib.sha256(actual_raw).hexdigest().upper(),
         'expected_sha256': hashlib.sha256(expected_raw).hexdigest().upper(),
         'actual_first_16_bytes': list(actual_raw[:16]),
@@ -234,6 +295,11 @@ def exercise(args, arena: dict, block: dict) -> dict:
         call(library.nrPlanCreate(ct.byref(Desc(arena['workspace_bytes'], 0, 1920, 1080)),
                                   ct.byref(handle)), 'create')
         call(library.nrPlanSetPrecisionProfile(handle, 1), 'set approximate profile')
+        if args.fixed_sequence:
+            call(library.nrPlanSetExecutionMode(handle, 1), 'set fixed command sequence')
+        if args.stop_after_qkv:
+            call(library.nrPlanDebugStopAfterStandardQkv(handle, 1),
+                 'enable QKV diagnostic stop')
         package_stats = ModelPackageStats()
         call(library.nrPlanLoadModelPackage(handle, str(args.package.resolve()).encode('utf-8'),
                                             ct.byref(package_stats)), 'load model package')
@@ -252,6 +318,7 @@ def exercise(args, arena: dict, block: dict) -> dict:
             'k': torch.full_like(encode_e4(k_expected), 0xA2),
             'v': torch.full_like(encode_e4(v_expected), 0xA3),
         }
+        post_resident_poison = torch.full_like(encode_e4(post_expected), 0xA4)
         # The poison tensors are produced on PyTorch's default stream while
         # NRPlan owns a private stream. Complete the producers before any D2D
         # initialization so this diagnostic cannot race two HIP streams.
@@ -262,6 +329,9 @@ def exercise(args, arena: dict, block: dict) -> dict:
             call(library.nrPlanInitializeArenaFromDevice(handle, offset,
                  ct.c_void_p(poison.data_ptr()), poison.numel()),
                  f'poison {label} resident output')
+        call(library.nrPlanInitializeArenaFromDevice(handle, block['post_resident_offset'],
+             ct.c_void_p(post_resident_poison.data_ptr()), post_resident_poison.numel()),
+             'poison post-FFN resident output')
         call(library.nrPlanFinalize(handle), 'finalize graph')
         def copy_arena(offset, template, operation='copy diagnostic intermediate'):
             target = torch.empty_like(template)
@@ -279,6 +349,11 @@ def exercise(args, arena: dict, block: dict) -> dict:
         if not all(torch.equal(poison_before_submit[label], qkv_poisons[label])
                    for label in ('q', 'k', 'v')):
             raise RuntimeError('Q/K/V arena poison changed before graph submission')
+        post_resident_poison_before_submit = copy_arena(
+            block['post_resident_offset'], post_resident_poison,
+            'copy pre-submit post-FFN resident poison')
+        if not torch.equal(post_resident_poison_before_submit, post_resident_poison):
+            raise RuntimeError('post-FFN resident arena poison changed before submission')
         graph = GraphStats()
         call(library.nrPlanGetGraphStats(handle, ct.byref(graph)), 'get graph stats')
         node_count = ct.c_uint64()
@@ -296,9 +371,9 @@ def exercise(args, arena: dict, block: dict) -> dict:
             'registers_per_thread': int(node.registers_per_thread),
             'static_shared_bytes': int(node.static_shared_bytes),
         } for node in node_values]
-        pack_ordinal = 3 if channels == 32 else 4
-        captured_arguments = (ct.c_uint64 * 6)()
-        call(library.nrPlanDebugGetKernelU64Arguments(handle, pack_ordinal, 6,
+        pack_ordinal = 3 if channels == 32 else 5
+        captured_arguments = (ct.c_uint64 * 4)()
+        call(library.nrPlanDebugGetKernelU64Arguments(handle, pack_ordinal, 4,
              captured_arguments), 'read QKV pack graph arguments')
         workspace_address = ct.c_uint64()
         weights_address = ct.c_uint64()
@@ -309,10 +384,8 @@ def exercise(args, arena: dict, block: dict) -> dict:
         expected_arguments = [
             workspace_address.value + block['qkv_projection_fp16_offset'],
             workspace_address.value + block['q_offset'],
-            workspace_address.value + block['k_offset'],
-            workspace_address.value + block['v_offset'],
             lut_address.value,
-            channels * 64 * 3,
+            channels * 64,
         ]
         kernel_argument_audit = {
             'kernel_ordinal': pack_ordinal,
@@ -323,6 +396,89 @@ def exercise(args, arena: dict, block: dict) -> dict:
             'weights_address': weights_address.value,
             'stage_e4_lut_address': lut_address.value,
         }
+        pointer_specs = {
+            'qkv_project': (1 if channels == 32 else 3, [
+                workspace_address.value + block['post_resident_offset'],
+                weights_address.value + block['qkv_weight_offset'],
+                weights_address.value + block['permutation_weight_offset'],
+                workspace_address.value + block['qkv_projection_fp16_offset'],
+            ]),
+            'qkv_norm': (2 if channels == 32 else 4, [
+                workspace_address.value + block['qkv_projection_fp16_offset'],
+                weights_address.value + block['qscale_weight_offset'],
+            ]),
+            'qkv_pack_q': (pack_ordinal, expected_arguments[:3]),
+            'qkv_pack_k': (pack_ordinal + 1, [
+                workspace_address.value + block['qkv_projection_fp16_offset'],
+                workspace_address.value + block['k_offset'],
+                lut_address.value,
+            ]),
+            'qkv_pack_v': (pack_ordinal + 2, [
+                workspace_address.value + block['qkv_projection_fp16_offset'],
+                workspace_address.value + block['v_offset'],
+                lut_address.value,
+            ]),
+        }
+        if channels != 32:
+            pointer_specs['ffn_mix'] = (1, [
+                workspace_address.value + block['grouped_offset'],
+                weights_address.value + block['ffn_mix_weight_offset'],
+                workspace_address.value + block['seed_fp16_offset'],
+                workspace_address.value + block['post_fp16_offset'],
+            ])
+            pointer_specs['ffn_resident_publish'] = (2, [
+                workspace_address.value + block['post_fp16_offset'],
+                workspace_address.value + block['post_resident_offset'],
+                lut_address.value,
+            ])
+        if not args.stop_after_qkv:
+            pointer_specs.update({
+            'attention': (6 if channels == 32 else 8, [
+                workspace_address.value + block['q_offset'],
+                workspace_address.value + block['k_offset'],
+                workspace_address.value + block['v_offset'],
+                weights_address.value + block['position_bias_weight_offset'],
+                workspace_address.value + block['value_offset'],
+            ]),
+            'project': (7 if channels == 32 else 9, [
+                workspace_address.value + block['post_fp16_offset'],
+                workspace_address.value + block['value_offset'],
+                weights_address.value + block['project_weight_offset'],
+                weights_address.value + block['residual_scale_weight_offset'],
+                weights_address.value + block['permutation_weight_offset'],
+                workspace_address.value + block['output_fp16_offset'],
+                workspace_address.value + block['post_resident_offset'],
+            ]),
+            'scatter': (8 if channels == 32 else 10, [
+                workspace_address.value + block['post_resident_offset'],
+                workspace_address.value + block['next_resident_offset'],
+            ]),
+            })
+        pointer_audits = {}
+        for label, (ordinal, expected_pointers) in pointer_specs.items():
+            values = (ct.c_uint64 * len(expected_pointers))()
+            call(library.nrPlanDebugGetKernelU64Arguments(handle, ordinal,
+                 len(expected_pointers), values), f'read {label} graph pointers')
+            captured_pointers = [int(value) for value in values]
+            pointer_audits[label] = {
+                'kernel_ordinal': ordinal,
+                'captured': captured_pointers,
+                'expected': expected_pointers,
+                'exact': captured_pointers == expected_pointers,
+            }
+        lut_expected = expected_e4_lut()
+        lut_device = torch.empty(len(lut_expected), dtype=torch.uint8, device='cuda')
+        call(library.nrPlanDebugCopyStageE4LutToDevice(handle,
+             ct.c_void_p(lut_device.data_ptr()), lut_device.numel()),
+             'copy stage E4M3 LUT')
+        lut_actual = lut_device.cpu().numpy().tobytes()
+        stage_e4_lut_audit = {
+            'bytes': len(lut_expected),
+            'exact': lut_actual == lut_expected,
+            'actual_sha256': hashlib.sha256(lut_actual).hexdigest().upper(),
+            'expected_sha256': hashlib.sha256(lut_expected).hexdigest().upper(),
+            'different_bytes': sum(a != b for a, b in zip(lut_actual, lut_expected)),
+        }
         dot_path = args.output / 'captured_graph.dot'
         call(library.nrPlanDebugDotPrint(handle, str(dot_path.resolve()).encode('utf-8')),
              'write captured graph DOT')
@@ -330,22 +486,167 @@ def exercise(args, arena: dict, block: dict) -> dict:
             dummy_output.data_ptr(), 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 0, 0, 8, 8,
             0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0, 1, 1, 0)
         call(library.nrPlanSubmitV3(handle, ct.byref(binding), None, None), 'submit')
+        execution_mode = ct.c_uint32()
+        fixed_sequence_submits = ct.c_uint64()
+        call(library.nrPlanDebugGetExecutionState(handle, ct.byref(execution_mode),
+             ct.byref(fixed_sequence_submits)), 'read execution state')
+        execution_state = {
+            'mode': execution_mode.value,
+            'fixed_sequence_submits': fixed_sequence_submits.value,
+        }
+        fixed_boundary_state = None
+        fixed_boundary_snapshots = None
+        if args.fixed_sequence and channels in (64, 128, 256):
+            stage_entries = ct.c_uint64()
+            post_copies = ct.c_uint64()
+            qkv_copies = ct.c_uint64()
+            scratch_bytes = ct.c_uint64()
+            call(library.nrPlanDebugGetFixedBoundaryState(handle,
+                 ct.byref(stage_entries), ct.byref(post_copies), ct.byref(qkv_copies),
+                 ct.byref(scratch_bytes)), 'read fixed boundary state')
+            fixed_boundary_state = {
+                'stage_entries': stage_entries.value,
+                'post_copies': post_copies.value,
+                'qkv_copies': qkv_copies.value,
+                'scratch_bytes': scratch_bytes.value,
+            }
+            scalar_bytes = channels * 64
+            fixed_boundary_snapshots = []
+            for part in range(4 if args.stop_after_qkv else 7):
+                target = torch.empty(scalar_bytes, dtype=torch.uint8, device='cuda')
+                call(library.nrPlanDebugCopyFixedBoundaryScratchToDevice(handle,
+                     part * scalar_bytes, ct.c_void_p(target.data_ptr()), scalar_bytes),
+                     f'copy fixed boundary scratch part {part}')
+                fixed_boundary_snapshots.append(target)
         call(library.nrPlanDebugCopyArenaToDevice(handle, block['next_resident_offset'],
              ct.c_void_p(output_bytes.data_ptr()), output_bytes.numel()), 'copy resident output')
+        if fixed_boundary_snapshots is not None and not args.stop_after_qkv:
+            output_bytes = fixed_boundary_snapshots[6].reshape_as(output_bytes)
         resources = ResourceStats()
         call(library.nrPlanGetResourceStats(handle, ct.byref(resources)), 'get resource stats')
         error = metric(output_bytes, expected)
         numerical_gate_pass = (error['finite'] and error['nrmse'] <= 0.02 and
                                error['max_absolute_error'] <= 0.25)
+        approximate_performance_gate_pass = (error['finite'] and error['nrmse'] <= 0.05 and
+                                             error['max_absolute_error'] <= 0.0625)
         diagnostics = None
         if args.diagnose_intermediates:
             def copy(offset, template):
                 return copy_arena(offset, template)
+            actual_post = copy(block['post_fp16_offset'], post_expected)
+            actual_post_resident = copy(block['post_resident_offset'],
+                                        encode_e4(post_expected))
             actual_projection = copy(block['qkv_projection_fp16_offset'], projection)
             actual_q = copy(block['q_offset'], encode_e4(q_expected))
             actual_k = copy(block['k_offset'], encode_e4(k_expected))
             actual_v = copy(block['v_offset'], encode_e4(v_expected))
+            direct_pack = None
+            direct_plan_arena_pack = None
+            direct_plan_stream_pack = None
+            direct_qkv_entry = None
+            direct_post_resident_publish = None
+            if channels == 256:
+                direct_post_resident = torch.empty_like(actual_post_resident)
+                call(library.nr_stage_debug_pack_e4x4_from_fp16(
+                     ct.c_void_p(actual_post.data_ptr()),
+                     ct.c_void_p(direct_post_resident.data_ptr()),
+                     ct.c_void_p(lut_address.value), actual_post.numel(),
+                     ct.c_void_p(torch.cuda.current_stream().cuda_stream)),
+                     'direct post-FFN resident publish')
+                torch.cuda.synchronize()
+                direct_post_resident_publish = metric(
+                    direct_post_resident, encode_e4(actual_post))
+                direct_parts = []
+                for part in range(3):
+                    target = torch.empty(channels * 64, dtype=torch.uint8, device='cuda')
+                    call(library.nr_stage_debug_pack_e4x4_c256(
+                         ct.c_void_p(actual_projection.data_ptr()),
+                         ct.c_void_p(target.data_ptr()), ct.c_void_p(lut_address.value),
+                         target.numel(), part,
+                         ct.c_void_p(torch.cuda.current_stream().cuda_stream)),
+                         f'direct pack part {part}')
+                    direct_parts.append(target)
+                torch.cuda.synchronize()
+                projection_parts = actual_projection.reshape(64, 3, channels)
+                direct_pack = {}
+                for part, label in enumerate(('q', 'k', 'v')):
+                    expected_direct = encode_e4(projection_parts[:, part]
+                        .reshape(64, channels // 32, 32).permute(1, 0, 2)
+                        .contiguous()).reshape(-1)
+                    direct_pack[label] = metric(direct_parts[part], expected_direct)
+                graph_parts = (actual_q, actual_k, actual_v)
+                for part, offset in enumerate((block['q_offset'], block['k_offset'],
+                                               block['v_offset'])):
+                    call(library.nr_stage_debug_pack_e4x4_c256(
+                         ct.c_void_p(workspace_address.value +
+                                     block['qkv_projection_fp16_offset']),
+                         ct.c_void_p(workspace_address.value + offset),
+                         ct.c_void_p(lut_address.value), channels * 64, part, None),
+                         f'direct plan-arena pack part {part}')
+                torch.cuda.synchronize()
+                repaired_parts = (
+                    copy(block['q_offset'], graph_parts[0]),
+                    copy(block['k_offset'], graph_parts[1]),
+                    copy(block['v_offset'], graph_parts[2]),
+                )
+                direct_plan_arena_pack = {}
+                for part, label in enumerate(('q', 'k', 'v')):
+                    expected_direct = encode_e4(projection_parts[:, part]
+                        .reshape(64, channels // 32, 32).permute(1, 0, 2)
+                        .contiguous()).reshape(-1)
+                    direct_plan_arena_pack[label] = metric(repaired_parts[part].reshape(-1),
+                                                            expected_direct)
+                plan_stream = ct.c_void_p()
+                call(library.nrPlanGetStream(handle, ct.byref(plan_stream)),
+                     'read plan stream')
+                for part, offset in enumerate((block['q_offset'], block['k_offset'],
+                                               block['v_offset'])):
+                    call(library.nr_stage_debug_pack_e4x4_c256(
+                         ct.c_void_p(workspace_address.value +
+                                     block['qkv_projection_fp16_offset']),
+                         ct.c_void_p(workspace_address.value + offset),
+                         ct.c_void_p(lut_address.value), channels * 64, part,
+                         plan_stream), f'direct plan-stream pack part {part}')
+                plan_stream_parts = (
+                    copy(block['q_offset'], graph_parts[0]),
+                    copy(block['k_offset'], graph_parts[1]),
+                    copy(block['v_offset'], graph_parts[2]),
+                )
+                direct_plan_stream_pack = {}
+                for part, label in enumerate(('q', 'k', 'v')):
+                    expected_direct = encode_e4(projection_parts[:, part]
+                        .reshape(64, channels // 32, 32).permute(1, 0, 2)
+                        .contiguous()).reshape(-1)
+                    direct_plan_stream_pack[label] = metric(
+                        plan_stream_parts[part].reshape(-1), expected_direct)
+                call(library.nr_stage_c256_qkv_norm_fp8(
+                     ct.c_void_p(workspace_address.value + block['post_resident_offset']),
+                     ct.c_void_p(weights_address.value + block['qkv_weight_offset']),
+                     ct.c_void_p(weights_address.value + block['qscale_weight_offset']),
+                     ct.c_void_p(weights_address.value + block['permutation_weight_offset']),
+                     ct.c_void_p(workspace_address.value +
+                                 block['qkv_projection_fp16_offset']),
+                     ct.c_void_p(workspace_address.value + block['q_offset']),
+                     ct.c_void_p(workspace_address.value + block['k_offset']),
+                     ct.c_void_p(workspace_address.value + block['v_offset']),
+                     ct.c_void_p(lut_address.value), 1, plan_stream),
+                     'direct exported QKV entry on plan stream')
+                entry_projection = copy(block['qkv_projection_fp16_offset'], projection)
+                entry_parts = (
+                    copy(block['q_offset'], graph_parts[0]).reshape(-1),
+                    copy(block['k_offset'], graph_parts[1]).reshape(-1),
+                    copy(block['v_offset'], graph_parts[2]).reshape(-1),
+                )
+                entry_projection_parts = entry_projection.reshape(64, 3, channels)
+                direct_qkv_entry = {}
+                for part, label in enumerate(('q', 'k', 'v')):
+                    expected_entry = encode_e4(entry_projection_parts[:, part]
+                        .reshape(64, channels // 32, 32).permute(1, 0, 2)
+                        .contiguous()).reshape(-1)
+                    direct_qkv_entry[label] = metric(entry_parts[part], expected_entry)
             diagnostic_tensors = {
+                'post_ffn_fp16': actual_post,
+                'post_ffn_resident_e4m3': actual_post_resident,
                 'qkv_projection_fp16': actual_projection,
                 'q_e4m3': actual_q,
                 'k_e4m3': actual_k,
@@ -373,9 +674,16 @@ def exercise(args, arena: dict, block: dict) -> dict:
             k_from_native_projection = encode_e4(
                 quantize_e4(normalize_qk(pk)).contiguous())
             v_from_native_projection = encode_e4(quantize_e4(pv).contiguous())
+            inplace_projection_parts = actual_projection.reshape(64, 3, channels)
+            inplace_projection_resident = [encode_e4(inplace_projection_parts[:, part]
+                .reshape(64, channels // 32, 32).permute(1, 0, 2).contiguous()).reshape(-1)
+                for part in range(3)]
             diagnostics = {
-                'post_ffn_fp16': metric_fp16(copy(block['post_fp16_offset'], post_expected),
-                                             post_expected),
+                'post_ffn_fp16': metric_fp16(actual_post, post_expected),
+                'post_ffn_resident_e4m3': metric(actual_post_resident,
+                                                  encode_e4(post_expected)),
+                'post_ffn_resident_vs_native_fp16': metric(
+                    actual_post_resident, encode_e4(actual_post)),
                 'qkv_projection_fp16': metric_fp16(actual_projection, projection),
                 'q_e4m3': metric(actual_q, encode_e4(q_expected)),
                 'k_e4m3': metric(actual_k, encode_e4(k_expected)),
@@ -395,21 +703,55 @@ def exercise(args, arena: dict, block: dict) -> dict:
                     copy(block['post_resident_offset'],
                          encode_e4(quantize_e4(output_expected))),
                     encode_e4(quantize_e4(output_expected))),
+                'direct_e4x4_pack_vs_projection': direct_pack,
+                'direct_plan_arena_e4x4_pack_vs_projection': direct_plan_arena_pack,
+                'direct_plan_stream_e4x4_pack_vs_projection': direct_plan_stream_pack,
+                'direct_exported_qkv_entry_vs_projection': direct_qkv_entry,
+                'direct_post_resident_publish_vs_native_fp16':
+                    direct_post_resident_publish,
+                'fixed_boundary_scratch': None if fixed_boundary_snapshots is None else {
+                    'post_vs_native_fp16': metric(fixed_boundary_snapshots[0].reshape_as(
+                                                  encode_e4(actual_post)),
+                                                  encode_e4(actual_post)),
+                    'q_vs_inplace_projection': metric(fixed_boundary_snapshots[1].reshape_as(
+                        inplace_projection_resident[0]), inplace_projection_resident[0]),
+                    'k_vs_inplace_projection': metric(fixed_boundary_snapshots[2].reshape_as(
+                        inplace_projection_resident[1]), inplace_projection_resident[1]),
+                    'v_vs_inplace_projection': metric(fixed_boundary_snapshots[3].reshape_as(
+                        inplace_projection_resident[2]), inplace_projection_resident[2]),
+                    'attention_value': None if args.stop_after_qkv else metric(
+                        fixed_boundary_snapshots[4].reshape_as(encode_e4(value_expected)),
+                        encode_e4(value_expected)),
+                    'project_resident': None if args.stop_after_qkv else metric(
+                        fixed_boundary_snapshots[5].reshape_as(
+                            encode_e4(quantize_e4(output_expected))),
+                        encode_e4(quantize_e4(output_expected))),
+                    'scatter_output': None if args.stop_after_qkv else metric(
+                        fixed_boundary_snapshots[6].reshape_as(expected), expected),
+                },
                 'raw_files': diagnostic_files,
             }
         return {
             'checks_pass': numerical_gate_pass and kernel_argument_audit['exact'] and \
-                graph.kernel_nodes == (7 if channels == 32 else 8),
+                all(row['exact'] for row in pointer_audits.values()) and \
+                stage_e4_lut_audit['exact'] and \
+                graph.kernel_nodes == ((6 if channels == 32 else 8)
+                    if args.stop_after_qkv else (9 if channels == 32 else 11)),
             'lifecycle_gate_pass': True,
             'numerical_gate_pass': numerical_gate_pass,
+            'approximate_performance_gate_pass': approximate_performance_gate_pass,
             'numerical_gate_limits': {'nrmse': 0.02, 'max_absolute_error': 0.25},
             'accuracy_track': 'approximate_fp8_not_promoted',
+            'execution_state': execution_state,
+            'fixed_boundary_state': fixed_boundary_state,
             'error_vs_reference': error,
             'intermediate_diagnostics': diagnostics,
             'graph': {'total_nodes': graph.total_nodes, 'kernel_nodes': graph.kernel_nodes,
                       'memcpy_nodes': graph.memcpy_nodes, 'kernel_details': kernel_nodes,
                       'dot_file': dot_path.name, 'dot_sha256': sha256(dot_path)},
             'kernel_argument_audit': kernel_argument_audit,
+            'kernel_pointer_audits': pointer_audits,
+            'stage_e4_lut_audit': stage_e4_lut_audit,
             'qkv_resident_poison': {
                 'bytes': {'q': 0xA1, 'k': 0xA2, 'v': 0xA3},
                 'bytes_per_buffer': next(iter(qkv_poisons.values())).numel(),
@@ -419,6 +761,13 @@ def exercise(args, arena: dict, block: dict) -> dict:
                     'k': int((actual_k == 0xA2).sum()) if diagnostics is not None else None,
                     'v': int((actual_v == 0xA3).sum()) if diagnostics is not None else None,
                 },
+            },
+            'post_resident_poison': {
+                'byte': 0xA4,
+                'bytes': post_resident_poison.numel(),
+                'verified_before_submit': True,
+                'remaining_after_submit': int((actual_post_resident == 0xA4).sum())
+                    if diagnostics is not None else None,
             },
             'resource': {'workspace_bytes': resources.workspace_bytes,
                          'weight_bytes': resources.weight_bytes,
@@ -484,6 +833,8 @@ def main() -> bool:
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--diagnose-intermediates', action='store_true')
+    parser.add_argument('--stop-after-qkv', action='store_true')
+    parser.add_argument('--fixed-sequence', action='store_true')
     parser.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     preflight_result, _, _ = preflight(args)
@@ -503,6 +854,10 @@ def main() -> bool:
         '--output', str(args.output.resolve())]
     if args.diagnose_intermediates:
         command.append('--diagnose-intermediates')
+    if args.stop_after_qkv:
+        command.append('--stop-after-qkv')
+    if args.fixed_sequence:
+        command.append('--fixed-sequence')
     return supervise(command, args.output, timeout=120)
 
 

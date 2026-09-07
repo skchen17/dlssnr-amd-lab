@@ -25,6 +25,8 @@ def test_ctypes_abi_v3_layout_is_fixed():
         'ApproxVitBlock': 152,
         'ApproxBottleneck': 112,
         'ApproxScaleTransition': 96,
+        'ApproxPre': 160,
+        'ApproxHead': 136,
         'PerformanceStats': 48,
         'ModelPackageStats': 272,
     }

@@ -1,4 +1,5 @@
 #include "nr_plan.h"
+#include "../native_stage_fp8/stage_fp8_api.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -11,6 +12,9 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <map>
+#include <iomanip>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -20,6 +24,38 @@
 #endif
 
 extern "C" int nr_stage_initialize_e4_lut(void**);
+extern "C" int nr_stage_debug_pack_e4x4_from_fp16(const void*,void*,const void*,
+    size_t,void*);
+extern "C" int nr_stage_debug_pack_e4x4_c256(const void*,void*,const void*,size_t,
+    int,void*);
+extern "C" int nr_stage_c256_qkv_projection_norm_fp16(const void*,const void*,
+    const void*,const void*,void*,int,void*);
+#define DECLARE_ORDERED_QKV(C) \
+extern "C" int nr_stage_c##C##_qkv_ordered_fp8(const void*,const void*,const void*, \
+    const void*,void*,void*,void*,void*,const void*,int,void*);
+DECLARE_ORDERED_QKV(32)
+DECLARE_ORDERED_QKV(64)
+DECLARE_ORDERED_QKV(128)
+DECLARE_ORDERED_QKV(256)
+#undef DECLARE_ORDERED_QKV
+#define DECLARE_COMPACT_QKV(C) \
+extern "C" int nr_stage_c##C##_qkv_compact_publish_fp8(const void*,const void*, \
+    const void*,const void*,void*,void*,void*,void*,const void*,int,void*);
+DECLARE_COMPACT_QKV(32)
+DECLARE_COMPACT_QKV(64)
+DECLARE_COMPACT_QKV(128)
+DECLARE_COMPACT_QKV(256)
+#undef DECLARE_COMPACT_QKV
+#define DECLARE_FULL_FUSED_QKV(C) \
+extern "C" int nr_stage_c##C##_qkv_full_fused_fp8(const void*,const void*, \
+    const void*,const void*,void*,void*,void*,const void*,int,void*); \
+extern "C" int nr_stage_c##C##_qkv_full_fused_from_fp16(const void*,const void*, \
+    const void*,const void*,void*,void*,void*,const void*,int,void*);
+DECLARE_FULL_FUSED_QKV(32)
+DECLARE_FULL_FUSED_QKV(64)
+DECLARE_FULL_FUSED_QKV(128)
+DECLARE_FULL_FUSED_QKV(256)
+#undef DECLARE_FULL_FUSED_QKV
 extern "C" int nr_stage_c64_qkv_norm_fp8(const void*,const void*,const void*,
     const void*,void*,void*,void*,void*,const void*,int,void*);
 extern "C" int nr_stage_c64_attention_fp8(const void*,const void*,const void*,
@@ -28,7 +64,7 @@ extern "C" int nr_stage_c64_project_fp8(const void*,const void*,const void*,
     const void*,const void*,void*,void*,int,void*);
 extern "C" int nr_stage_c64_ffn_fp8(const void*,const void*,const void*,const void*,
     const void*,const void*,const void*,const void*,const void*,void*,void*,void*,void*,
-    int,int,int,int,int,void*);
+    const void*,int,int,int,int,int,int,void*);
 extern "C" int nr_stage_c64_scatter_fp8(const void*,void*,int,int,int,int,void*);
 extern "C" int nr_stage_c32_qkv_norm_fp8(const void*,const void*,const void*,
     const void*,void*,void*,void*,void*,const void*,int,void*);
@@ -48,7 +84,7 @@ extern "C" int nr_stage_c128_project_fp8(const void*,const void*,const void*,
     const void*,const void*,void*,void*,int,void*);
 extern "C" int nr_stage_c128_ffn_fp8(const void*,const void*,const void*,const void*,
     const void*,const void*,const void*,const void*,const void*,void*,void*,void*,void*,
-    int,int,int,int,int,void*);
+    const void*,int,int,int,int,int,int,void*);
 extern "C" int nr_stage_c128_scatter_fp8(const void*,void*,int,int,int,int,void*);
 extern "C" int nr_stage_c256_qkv_norm_fp8(const void*,const void*,const void*,
     const void*,void*,void*,void*,void*,const void*,int,void*);
@@ -58,8 +94,18 @@ extern "C" int nr_stage_c256_project_fp8(const void*,const void*,const void*,
     const void*,const void*,void*,void*,int,void*);
 extern "C" int nr_stage_c256_ffn_fp8(const void*,const void*,const void*,const void*,
     const void*,const void*,const void*,const void*,const void*,void*,void*,void*,void*,
-    int,int,int,int,int,void*);
+    const void*,int,int,int,int,int,int,void*);
 extern "C" int nr_stage_c256_scatter_fp8(const void*,void*,int,int,int,int,void*);
+#define DECLARE_STANDARD_STAGE_BLOCK(C) \
+extern "C" int nr_stage_c##C##_block_fp8(const void*,const void*,const void*, \
+    const void*,const void*,const void*,const void*,const void*,const void*,void*, \
+    void*,void*,void*,const void*,const void*,const void*,void*,void*,void*,void*, \
+    const void*,const void*,void*,const void*,const void*,void*,void*,int,int,int,int, \
+    int,int,int,void*);
+DECLARE_STANDARD_STAGE_BLOCK(64)
+DECLARE_STANDARD_STAGE_BLOCK(128)
+DECLARE_STANDARD_STAGE_BLOCK(256)
+#undef DECLARE_STANDARD_STAGE_BLOCK
 extern "C" int nr_stage_c512_ffn_fp8(const void*,const void*,const void*,const void*,
     const void*,const void*,const void*,const void*,const void*,const void*,const void*,
     void*,void*,void*,void*,int,int,int,int,int,void*);
@@ -81,6 +127,14 @@ extern "C" int nr_transition_encoder_fp8(const void*,const void*,void*,const voi
     const void*,void*,int,int,int,int,int,void*);
 extern "C" int nr_transition_decoder_fp8(const void*,const void*,const void*,const void*,
     const void*,void*,int,int,int,void*);
+extern "C" int nr_io_pre_project_pack_v3(const void*,const void*,void*,int,int,
+    float,const float*,uint32_t,void*);
+extern "C" int nr_io_pre_pool_fp8(const void*,void*,void*,int,int,void*);
+extern "C" int nr_io_head_input_fp8(const void*,const void*,const void*,const void*,
+    void*,int,int,void*);
+extern "C" int nr_io_head_tail_v3(const void*,const void*,const void*,uint64_t,int,void*);
+extern "C" int nr_stage_head_c32_ffn_fp8(const void*,const void*,const void*,const void*,
+    const void*,const void*,const void*,void*,void*,int,void*);
 
 struct NRPlan {
     NRPlanDesc desc{};
@@ -105,6 +159,59 @@ struct NRPlan {
     uint64_t output_bytes{};
     void* stage_e4_lut{};
     bool stage_e4_lut_initialized{};
+    // Temporary fixed-sequence bring-up buffer. The large arena exposed a
+    // gfx1201 publication defect for byte-packed E4M3 destinations; publishing
+    // into this plan-owned allocation and copying the completed bytes back
+    // keeps the mathematical boundary explicit while the graph-native fix is
+    // developed. It is allocated once and never resized in the frame hot path.
+    void* fixed_boundary_scratch{};
+    uint64_t fixed_boundary_scratch_bytes{};
+    uint64_t fixed_boundary_stage_entries{};
+    uint64_t fixed_boundary_post_copies{};
+    uint64_t fixed_boundary_qkv_copies{};
+    const void* fixed_resident_chain_input{};
+    uint32_t fixed_resident_chain_channels{};
+    uint32_t fixed_resident_chain_width{};
+    uint32_t fixed_resident_chain_height{};
+    // Fixed-sequence scale boundaries use compact plan-owned byte allocations.
+    // The generic arena remains the graph/reference ABI, but gfx1201 did not
+    // reliably publish byte-packed E4M3 stage results into its large subranges.
+    // One target is sufficient because every following stage consumes it
+    // before producing a new resident result; encoder skips persist until the
+    // symmetric decoder transition and therefore have four disjoint regions.
+    void* fixed_transition_target{};
+    uint64_t fixed_transition_target_bytes{};
+    void* fixed_transition_skip_pool{};
+    uint64_t fixed_transition_skip_pool_bytes{};
+    std::array<uint64_t,4> fixed_transition_skip_offsets{};
+    std::array<uint64_t,4> fixed_transition_skip_sizes{};
+    uint64_t fixed_transition_encoder_chains{};
+    uint64_t fixed_transition_decoder_chains{};
+    // The central C512/ViT path has a different token layout from Swin.  It
+    // owns one persistent C512 skip plus a compact ten-activation ViT pool:
+    // 4x hidden, post, Q, K, V, value, and an in-place next/input slot.
+    void* fixed_bottleneck_skip{};
+    uint64_t fixed_bottleneck_skip_bytes{};
+    void* fixed_vit_scratch{};
+    uint64_t fixed_vit_scratch_bytes{};
+    uint64_t fixed_bottleneck_encoder_chains{};
+    uint64_t fixed_vit_block_chains{};
+    uint64_t fixed_bottleneck_decoder_chains{};
+    // Pre and Head share one large full-resolution edge scratch because their
+    // lifetimes never overlap. Pre's skip persists until Head consumes it.
+    void* fixed_edge_scratch{};
+    uint64_t fixed_edge_scratch_bytes{};
+    void* fixed_pre_skip{};
+    uint64_t fixed_pre_skip_bytes{};
+    NRApproxPreDesc approximate_pre{};
+    NRApproxHeadDesc approximate_head{};
+    bool has_approximate_pre{};
+    bool has_approximate_head{};
+    bool approximate_edge_compact_qkv{};
+    bool approximate_standard_compact_qkv{};
+    bool approximate_full_fused_qkv{};
+    bool approximate_fused_qkv_consumes_fp16{};
+    bool approximate_elide_redundant_post_publish{};
     uint32_t static_width{};
     uint32_t static_height{};
     bool owns_graph{};
@@ -114,6 +221,8 @@ struct NRPlan {
     bool prepared{};
     bool timing_pending{};
     NRPrecisionProfile precision{NR_PRECISION_STRICT_FP16};
+    NRExecutionMode execution_mode{NR_EXECUTION_GRAPH_REPLAY};
+    uint64_t fixed_sequence_submits{};
     NRShapeDesc shape{};
     NRPlanPerformanceStats performance{};
     bool weights_uploaded{};
@@ -126,7 +235,25 @@ struct NRPlan {
     bool has_approximate_bottleneck{};
     std::vector<NRApproxScaleTransitionDesc> approximate_scale_transitions;
     bool complete_native_topology{};
+    bool debug_stop_after_standard_qkv{};
+    bool fixed_sequence_host_boundaries{true};
+    bool recording_graph{};
+    std::map<hipGraphNode_t,std::string> diagnostic_labels;
+    std::vector<hipGraphNode_t> diagnostic_nodes;
+    std::vector<hipEvent_t> diagnostic_events;
 };
+
+#include "operation_timing.inc"
+
+static hipError_t fixed_boundary(NRPlan* plan,hipError_t error) {
+    if(error!=hipSuccess||!plan->fixed_sequence_host_boundaries)return error;
+    return hipStreamSynchronize(plan->stream);
+}
+
+static bool fixed_resident_recording(const NRPlan* plan) {
+    return plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE&&
+        (!plan->recording_graph||!plan->fixed_sequence_host_boundaries);
+}
 
 static hipError_t ensure_stage_e4_lut(NRPlan* plan) {
     if (plan->stage_e4_lut_initialized) return hipSuccess;
@@ -174,6 +301,28 @@ static hipError_t instantiate_graph(hipGraph_t graph,hipGraphExec_t* executable)
 #endif
 }
 
+// Windows ROCm instantiates long graphs on the large-stack helper thread above.
+// Refresh every kernel node on the owning thread so the executable receives a
+// fresh copy of the captured function and argument block before first replay.
+static hipError_t refresh_executable_kernel_params(hipGraph_t graph,
+    hipGraphExec_t executable) {
+    size_t count=0;
+    hipError_t error=hipGraphGetNodes(graph,nullptr,&count);
+    if(error!=hipSuccess)return error;
+    std::vector<hipGraphNode_t> nodes(count);
+    if(count){error=hipGraphGetNodes(graph,nodes.data(),&count);if(error!=hipSuccess)return error;}
+    for(size_t index=0;index<count;++index){
+        hipGraphNodeType type{};
+        error=hipGraphNodeGetType(nodes[index],&type);if(error!=hipSuccess)return error;
+        if(type!=hipGraphNodeTypeKernel)continue;
+        hipKernelNodeParams params{};
+        error=hipGraphKernelNodeGetParams(nodes[index],&params);if(error!=hipSuccess)return error;
+        error=hipGraphExecKernelNodeSetParams(executable,nodes[index],&params);
+        if(error!=hipSuccess)return error;
+    }
+    return hipSuccess;
+}
+
 static hipError_t cleanup(NRPlan* plan) {
     if(!plan)return hipSuccess;
     hipError_t first=hipSuccess;
@@ -181,6 +330,7 @@ static hipError_t cleanup(NRPlan* plan) {
     if(plan->stream)keep(hipStreamSynchronize(plan->stream));
     if(plan->executable)keep(hipGraphExecDestroy(plan->executable));
     if(plan->graph&&plan->owns_graph)keep(hipGraphDestroy(plan->graph));
+    for(auto event:plan->diagnostic_events)if(event)keep(hipEventDestroy(event));
     if(plan->binding_consumed)keep(hipEventDestroy(plan->binding_consumed));
     if(plan->timing_start)keep(hipEventDestroy(plan->timing_start));
     if(plan->timing_stop)keep(hipEventDestroy(plan->timing_stop));
@@ -189,6 +339,13 @@ static hipError_t cleanup(NRPlan* plan) {
     if(plan->device_bindings_v3)keep(hipFree(plan->device_bindings_v3));
     if(plan->pinned_bindings_v3)keep(hipHostFree(plan->pinned_bindings_v3));
     if(plan->stage_e4_lut)keep(hipFree(plan->stage_e4_lut));
+    if(plan->fixed_boundary_scratch)keep(hipFree(plan->fixed_boundary_scratch));
+    if(plan->fixed_transition_target)keep(hipFree(plan->fixed_transition_target));
+    if(plan->fixed_transition_skip_pool)keep(hipFree(plan->fixed_transition_skip_pool));
+    if(plan->fixed_bottleneck_skip)keep(hipFree(plan->fixed_bottleneck_skip));
+    if(plan->fixed_vit_scratch)keep(hipFree(plan->fixed_vit_scratch));
+    if(plan->fixed_edge_scratch)keep(hipFree(plan->fixed_edge_scratch));
+    if(plan->fixed_pre_skip)keep(hipFree(plan->fixed_pre_skip));
     if(plan->weights)keep(hipFree(plan->weights));
     if(plan->workspace)keep(hipFree(plan->workspace));
     if(plan->stream)keep(hipStreamDestroy(plan->stream));
@@ -380,7 +537,8 @@ NRPLAN_API hipError_t nrPlanLoadModelPackage(NRPlan* plan,const char* path,
 NRPLAN_API hipError_t nrPlanSetRecorder(NRPlan* plan,NRPlanRecordFn record,void* user) {
     if(!plan||!record||plan->finalized||plan->record_v3||
        !plan->approximate_stage_blocks.empty()||!plan->approximate_split512_blocks.empty()||
-       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck)
+       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck||
+       plan->has_approximate_pre||plan->has_approximate_head)
         return hipErrorInvalidValue;
     plan->record=record;plan->record_user=user;return hipSuccess;
 }
@@ -388,7 +546,8 @@ NRPLAN_API hipError_t nrPlanSetRecorder(NRPlan* plan,NRPlanRecordFn record,void*
 NRPLAN_API hipError_t nrPlanSetRecorderV3(NRPlan* plan,NRPlanRecordFnV3 record,void* user) {
     if(!plan||!record||plan->finalized||plan->record||
        !plan->approximate_stage_blocks.empty()||!plan->approximate_split512_blocks.empty()||
-       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck)
+       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck||
+       plan->has_approximate_pre||plan->has_approximate_head)
         return hipErrorInvalidValue;
     plan->record_v3=record;plan->record_user=user;return hipSuccess;
 }
@@ -422,7 +581,8 @@ NRPLAN_API hipError_t nrPlanGetStream(NRPlan* plan,hipStream_t* out_stream) {
 NRPLAN_API hipError_t nrPlanAdoptGraph(NRPlan* plan,hipGraph_t source_graph) {
     if(!plan||!source_graph||plan->finalized||plan->record||plan->record_v3||
        !plan->approximate_stage_blocks.empty()||!plan->approximate_split512_blocks.empty()||
-       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck)
+       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck||
+       plan->has_approximate_pre||plan->has_approximate_head)
         return hipErrorInvalidValue;
     hipGraphExec_t executable{};
     hipError_t error=instantiate_graph(source_graph,&executable);
@@ -577,6 +737,69 @@ NRPLAN_API hipError_t nrPlanDebugGetOwnedAddresses(NRPlan* plan,
     return hipSuccess;
 }
 
+NRPLAN_API hipError_t nrPlanDebugCopyStageE4LutToDevice(NRPlan* plan,
+    void* target,uint64_t bytes) {
+    constexpr uint64_t table_bytes=65536;
+    if(!plan||!target||!plan->stage_e4_lut_initialized||!plan->stage_e4_lut||
+       !bytes||bytes>table_bytes)return hipErrorInvalidValue;
+    hipError_t error=hipStreamSynchronize(plan->stream);
+    if(error==hipSuccess)error=hipMemcpyAsync(target,plan->stage_e4_lut,size_t(bytes),
+        hipMemcpyDeviceToDevice,plan->stream);
+    return error==hipSuccess?hipStreamSynchronize(plan->stream):error;
+}
+
+NRPLAN_API hipError_t nrPlanDebugStopAfterStandardQkv(NRPlan* plan,uint8_t enabled) {
+    if(!plan||plan->finalized||enabled>1)return hipErrorInvalidValue;
+    plan->debug_stop_after_standard_qkv=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetExecutionMode(NRPlan* plan,NRExecutionMode mode) {
+    if(!plan||plan->finalized||(mode!=NR_EXECUTION_GRAPH_REPLAY&&
+       mode!=NR_EXECUTION_FIXED_SEQUENCE))return hipErrorInvalidValue;
+    plan->execution_mode=mode;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugGetExecutionState(NRPlan* plan,uint32_t* mode,
+    uint64_t* fixed_sequence_submits) {
+    if(!plan||!mode||!fixed_sequence_submits)return hipErrorInvalidValue;
+    *mode=uint32_t(plan->execution_mode);
+    *fixed_sequence_submits=plan->fixed_sequence_submits;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugSetFixedHostBoundaries(NRPlan* plan,uint8_t enabled) {
+    if(!plan||plan->finalized||enabled>1||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE)return hipErrorInvalidValue;
+    plan->fixed_sequence_host_boundaries=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugGetFixedBoundaryState(NRPlan* plan,
+    uint64_t* stage_entries,uint64_t* post_copies,uint64_t* qkv_copies,
+    uint64_t* scratch_bytes) {
+    if(!plan||!stage_entries||!post_copies||!qkv_copies||!scratch_bytes)
+        return hipErrorInvalidValue;
+    *stage_entries=plan->fixed_boundary_stage_entries;
+    *post_copies=plan->fixed_boundary_post_copies;
+    *qkv_copies=plan->fixed_boundary_qkv_copies;
+    *scratch_bytes=plan->fixed_boundary_scratch_bytes;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugCopyFixedBoundaryScratchToDevice(NRPlan* plan,
+    uint64_t offset,void* target,uint64_t bytes) {
+    if(!plan||!target||!plan->fixed_boundary_scratch||
+       offset>plan->fixed_boundary_scratch_bytes||
+       bytes>plan->fixed_boundary_scratch_bytes-offset)return hipErrorInvalidValue;
+    hipError_t error=hipStreamSynchronize(plan->stream);
+    if(error==hipSuccess)error=hipMemcpyAsync(target,
+        static_cast<uint8_t*>(plan->fixed_boundary_scratch)+offset,size_t(bytes),
+        hipMemcpyDeviceToDevice,plan->stream);
+    return error==hipSuccess?hipStreamSynchronize(plan->stream):error;
+}
+
 __global__ static void nrplan_stage_marker(uint32_t* scratch,uint32_t boundary) {
     if(blockIdx.x==0&&threadIdx.x==0)*scratch=boundary;
 }
@@ -601,7 +824,8 @@ NRPLAN_API hipError_t nrPlanGetResourceStats(NRPlan* plan,NRPlanResourceStats* o
     // because this version of the DLL happens to know that structure.
     const bool builtin=!plan->approximate_stage_blocks.empty()||
                        !plan->approximate_split512_blocks.empty()||
-                       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck;
+                       !plan->approximate_vit_blocks.empty()||plan->has_approximate_bottleneck||
+                       plan->has_approximate_pre||plan->has_approximate_head;
     stats.frame_bindings_abi_version=(plan->record_v3||builtin)?
         NR_PLAN_FRAME_BINDINGS_ABI_VERSION_V3:NR_PLAN_FRAME_BINDINGS_ABI_VERSION;
     stats.deployment_ready=stats.owns_workspace&&stats.owns_weights&&stats.owns_graph_source&&
@@ -611,10 +835,16 @@ NRPLAN_API hipError_t nrPlanGetResourceStats(NRPlan* plan,NRPlanResourceStats* o
     stats.native_stage_block_count=uint32_t(plan->approximate_stage_blocks.size()+
                                              plan->approximate_split512_blocks.size()+
                                              plan->approximate_vit_blocks.size()+
-                                             (plan->has_approximate_bottleneck?1:0));
+                                             (plan->has_approximate_bottleneck?1:0)+
+                                             (plan->has_approximate_pre?1:0)+
+                                             (plan->has_approximate_head?1:0));
     stats.complete_native_topology=plan->complete_native_topology;
-    stats.deployment_ready=stats.deployment_ready&&stats.complete_native_topology;
     stats.temporal_contract_verified=plan->temporal_contract_verified;
+    // A reset/single-color graph can prove native record coverage without
+    // proving the original history/motion/depth/exposure contract. Keep it out
+    // of deployment until both conditions are independently established.
+    stats.deployment_ready=stats.deployment_ready&&stats.complete_native_topology&&
+        stats.temporal_contract_verified;
     stats.precision_profile=uint8_t(plan->precision);
     *out_stats=stats;return hipSuccess;
 }
@@ -723,6 +953,22 @@ NRPLAN_API hipError_t nrPlanConfigureApproxStageBlocks(NRPlan* plan,
     for(const auto& vit:plan->approximate_vit_blocks)
         for(const auto& block:copy)
             if(vit.record_number==block.record_number)return hipErrorInvalidValue;
+    uint64_t scratch_bytes=0;
+    if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE){
+        for(const auto& block:copy)
+            if(block.channels==32||block.channels==64||block.channels==128||
+               block.channels==256)
+                scratch_bytes=std::max(scratch_bytes,
+                    uint64_t(block.windows)*64*block.channels*7);
+    }
+    if(scratch_bytes>plan->fixed_boundary_scratch_bytes){
+        void* replacement{};
+        hipError_t allocation=hipMalloc(&replacement,size_t(scratch_bytes));
+        if(allocation!=hipSuccess)return allocation;
+        if(plan->fixed_boundary_scratch)(void)hipFree(plan->fixed_boundary_scratch);
+        plan->fixed_boundary_scratch=replacement;
+        plan->fixed_boundary_scratch_bytes=scratch_bytes;
+    }
     plan->approximate_stage_blocks=std::move(copy);
     plan->complete_native_topology=false;
     return hipSuccess;
@@ -788,6 +1034,19 @@ NRPLAN_API hipError_t nrPlanConfigureApproxSplit512Blocks(NRPlan* plan,
             if(vit.record_number==block.record_number)return hipErrorInvalidValue;
         copy.push_back(block);
     }
+    uint64_t scratch_bytes=plan->fixed_boundary_scratch_bytes;
+    if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE)
+        for(const auto& block:copy)
+            scratch_bytes=std::max(scratch_bytes,
+                uint64_t(block.windows)*64*512*8);
+    if(scratch_bytes>plan->fixed_boundary_scratch_bytes){
+        void* replacement{};
+        hipError_t allocation=hipMalloc(&replacement,size_t(scratch_bytes));
+        if(allocation!=hipSuccess)return allocation;
+        if(plan->fixed_boundary_scratch)(void)hipFree(plan->fixed_boundary_scratch);
+        plan->fixed_boundary_scratch=replacement;
+        plan->fixed_boundary_scratch_bytes=scratch_bytes;
+    }
     plan->approximate_split512_blocks=std::move(copy);
     plan->complete_native_topology=false;
     return hipSuccess;
@@ -831,6 +1090,18 @@ NRPLAN_API hipError_t nrPlanConfigureApproxVitBlocks(NRPlan* plan,
             if(split.record_number==block.record_number)return hipErrorInvalidValue;
         copy.push_back(block);
     }
+    if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE){
+        const uint64_t activation=uint64_t(copy.front().tokens)*1024;
+        const uint64_t required=activation*10;
+        if(required>plan->fixed_vit_scratch_bytes){
+            void* replacement{};
+            hipError_t error=hipMalloc(&replacement,size_t(required));
+            if(error!=hipSuccess)return error;
+            if(plan->fixed_vit_scratch)(void)hipFree(plan->fixed_vit_scratch);
+            plan->fixed_vit_scratch=replacement;
+            plan->fixed_vit_scratch_bytes=required;
+        }
+    }
     plan->approximate_vit_blocks=std::move(copy);
     plan->complete_native_topology=false;
     return hipSuccess;
@@ -865,6 +1136,27 @@ NRPLAN_API hipError_t nrPlanConfigureApproxBottleneck(NRPlan* plan,
     for(const auto& range:weight_ranges)
         if(!range_fits(range.first,range.second,plan->desc.weight_bytes))
             return hipErrorInvalidValue;
+    if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE){
+        void* replacement_skip{};
+        void* replacement_target{};
+        hipError_t error=hipMalloc(&replacement_skip,size_t(c512));
+        const bool replace_target=c512>plan->fixed_transition_target_bytes;
+        if(error==hipSuccess&&replace_target)
+            error=hipMalloc(&replacement_target,size_t(c512));
+        if(error!=hipSuccess){
+            if(replacement_skip)(void)hipFree(replacement_skip);
+            if(replacement_target)(void)hipFree(replacement_target);
+            return error;
+        }
+        if(plan->fixed_bottleneck_skip)(void)hipFree(plan->fixed_bottleneck_skip);
+        plan->fixed_bottleneck_skip=replacement_skip;
+        plan->fixed_bottleneck_skip_bytes=c512;
+        if(replace_target){
+            if(plan->fixed_transition_target)(void)hipFree(plan->fixed_transition_target);
+            plan->fixed_transition_target=replacement_target;
+            plan->fixed_transition_target_bytes=c512;
+        }
+    }
     plan->approximate_bottleneck=value;plan->has_approximate_bottleneck=true;
     plan->complete_native_topology=false;
     return hipSuccess;
@@ -881,6 +1173,9 @@ NRPLAN_API hipError_t nrPlanConfigureApproxScaleTransitions(NRPlan* plan,
     constexpr std::array<uint32_t,4> encoder_channels{{32,64,128,256}};
     constexpr std::array<uint32_t,4> decoder_channels{{256,128,64,32}};
     std::vector<NRApproxScaleTransitionDesc> copy;copy.reserve(count);
+    uint64_t fixed_target_bytes=0,fixed_skip_bytes=0;
+    std::array<uint64_t,4> fixed_skip_offsets{};
+    std::array<uint64_t,4> fixed_skip_sizes{};
     uint32_t encoder_number=0,decoder_number=0;
     for(uint32_t i=0;i<count;++i){
         NRApproxScaleTransitionDesc value=descriptors[i];
@@ -929,12 +1224,359 @@ NRPLAN_API hipError_t nrPlanConfigureApproxScaleTransitions(NRPlan* plan,
            (value.direction==NR_TRANSITION_DECODER_UPSAMPLE&&
             !range_fits(value.skip_scale_weight_offset,uint64_t(value.channels)*2,
                         plan->desc.weight_bytes)))return hipErrorInvalidValue;
+        fixed_target_bytes=std::max(fixed_target_bytes,target_bytes);
+        if(value.direction==NR_TRANSITION_ENCODER_DOWNSAMPLE){
+            const uint32_t slot=value.channels==32?0:value.channels==64?1:
+                value.channels==128?2:3;
+            fixed_skip_offsets[slot]=fixed_skip_bytes;
+            fixed_skip_sizes[slot]=skip_bytes;
+            fixed_skip_bytes+=skip_bytes;
+        }
         copy.push_back(value);
     }
     if(encoder_number!=4||decoder_number!=4)return hipErrorInvalidValue;
+    void* replacement_target{};void* replacement_skips{};
+    hipError_t allocation=hipMalloc(&replacement_target,size_t(fixed_target_bytes));
+    if(allocation==hipSuccess)
+        allocation=hipMalloc(&replacement_skips,size_t(fixed_skip_bytes));
+    if(allocation!=hipSuccess){
+        if(replacement_target)(void)hipFree(replacement_target);
+        if(replacement_skips)(void)hipFree(replacement_skips);
+        return allocation;
+    }
+    if(plan->fixed_transition_target)(void)hipFree(plan->fixed_transition_target);
+    if(plan->fixed_transition_skip_pool)(void)hipFree(plan->fixed_transition_skip_pool);
+    plan->fixed_transition_target=replacement_target;
+    plan->fixed_transition_target_bytes=fixed_target_bytes;
+    plan->fixed_transition_skip_pool=replacement_skips;
+    plan->fixed_transition_skip_pool_bytes=fixed_skip_bytes;
+    plan->fixed_transition_skip_offsets=fixed_skip_offsets;
+    plan->fixed_transition_skip_sizes=fixed_skip_sizes;
     plan->approximate_scale_transitions=std::move(copy);
     plan->complete_native_topology=false;
     return hipSuccess;
+}
+
+static void refresh_complete_native_topology(NRPlan* plan) {
+    if(!plan)return;
+    const bool wide=plan->approximate_stage_blocks.size()==44&&
+        plan->approximate_stage_blocks.front().record_number==1&&
+        plan->approximate_stage_blocks.back().record_number==69;
+    plan->complete_native_topology=wide&&plan->approximate_split512_blocks.size()==16&&
+        plan->approximate_vit_blocks.size()==8&&plan->has_approximate_bottleneck&&
+        plan->approximate_scale_transitions.size()==8&&plan->has_approximate_pre&&
+        plan->has_approximate_head;
+}
+
+static hipError_t allocate_edge_storage(NRPlan* plan,uint64_t scratch_bytes,
+    uint64_t pre_skip_bytes,uint64_t pooled_bytes) {
+    void* scratch{};void* skip{};void* target{};
+    const bool replace_scratch=scratch_bytes>plan->fixed_edge_scratch_bytes;
+    const bool replace_skip=pre_skip_bytes>plan->fixed_pre_skip_bytes;
+    const bool replace_target=pooled_bytes>plan->fixed_transition_target_bytes;
+    hipError_t error=hipSuccess;
+    if(replace_scratch)error=hipMalloc(&scratch,size_t(scratch_bytes));
+    if(error==hipSuccess&&replace_skip)error=hipMalloc(&skip,size_t(pre_skip_bytes));
+    if(error==hipSuccess&&replace_target)error=hipMalloc(&target,size_t(pooled_bytes));
+    if(error!=hipSuccess){
+        if(scratch)(void)hipFree(scratch);if(skip)(void)hipFree(skip);
+        if(target)(void)hipFree(target);return error;
+    }
+    if(replace_scratch){if(plan->fixed_edge_scratch)(void)hipFree(plan->fixed_edge_scratch);
+        plan->fixed_edge_scratch=scratch;plan->fixed_edge_scratch_bytes=scratch_bytes;}
+    if(replace_skip){if(plan->fixed_pre_skip)(void)hipFree(plan->fixed_pre_skip);
+        plan->fixed_pre_skip=skip;plan->fixed_pre_skip_bytes=pre_skip_bytes;}
+    if(replace_target){if(plan->fixed_transition_target)(void)hipFree(plan->fixed_transition_target);
+        plan->fixed_transition_target=target;plan->fixed_transition_target_bytes=pooled_bytes;}
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanConfigureApproxPre(NRPlan* plan,
+    const NRApproxPreDesc* descriptor) {
+    if(!plan||!descriptor||plan->has_approximate_pre||plan->finalized||plan->record||
+       plan->record_v3||plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8||!plan->weights_uploaded||
+       !plan->prepared)return hipErrorInvalidValue;
+    NRApproxPreDesc value=*descriptor;
+    if(value.struct_size!=sizeof(value)||!value.padded_width||!value.padded_height||
+       (value.padded_width&127)||(value.padded_height&127)||value.reserved||
+       value.windows!=uint64_t(value.padded_width/8)*(value.padded_height/8)||
+       !std::isfinite(value.color_scale))return hipErrorInvalidValue;
+    for(float conditioning:value.conditioning)
+        if(!std::isfinite(conditioning))return hipErrorInvalidValue;
+    const std::array<std::pair<uint64_t,uint64_t>,14> ranges{{
+        {value.input_project_weight_offset,16ull*32*2},
+        {value.ffn_expand_weight_offset,32ull*128},
+        {value.ffn_contract_weight_offset,128ull*32},
+        {value.ffn_scale_weight_offset,32ull*2},
+        {value.a_index_weight_offset,64ull*32*4},
+        {value.residual_index_weight_offset,64ull*32*4},
+        {value.ffn_permutation_weight_offset,32ull*4},
+        {value.ffn_inverse_permutation_weight_offset,32ull*4},
+        {value.qkv_weight_offset,32ull*96},
+        {value.qscale_weight_offset,2},
+        {value.permutation_weight_offset,32ull*4},
+        {value.position_bias_weight_offset,64ull*64*2},
+        {value.project_weight_offset,32ull*32},
+        {value.residual_scale_weight_offset,32ull*2}}};
+    for(const auto& range:ranges)
+        if(!range_fits(range.first,range.second,plan->desc.weight_bytes))
+            return hipErrorInvalidValue;
+    const uint64_t pre_values=uint64_t(value.padded_width)*value.padded_height*32;
+    const uint64_t pooled_values=pre_values/4;
+    const uint64_t head_windows=uint64_t((value.padded_width+11)/8)*
+        ((value.padded_height+11)/8);
+    const uint64_t edge_values=std::max<uint64_t>(value.windows,head_windows)*64*32;
+    // Twelve scalar-sized lanes are sufficient when lifetime-disjoint buffers
+    // alias: raw -> Q, QKV projection -> value/output. The earlier 16-lane
+    // bring-up layout wasted four full-resolution lanes (~286 MiB at 1080p).
+    if(edge_values>std::numeric_limits<uint64_t>::max()/12)return hipErrorInvalidValue;
+    hipError_t error=allocate_edge_storage(plan,edge_values*12,pre_values,pooled_values);
+    if(error!=hipSuccess)return error;
+    plan->approximate_pre=value;plan->has_approximate_pre=true;
+    refresh_complete_native_topology(plan);return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanConfigureApproxHead(NRPlan* plan,
+    const NRApproxHeadDesc* descriptor) {
+    if(!plan||!descriptor||plan->has_approximate_head||plan->finalized||plan->record||
+       plan->record_v3||plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8||!plan->weights_uploaded||
+       !plan->prepared||!plan->has_approximate_pre)return hipErrorInvalidValue;
+    NRApproxHeadDesc value=*descriptor;
+    if(value.struct_size!=sizeof(value)||value.padded_width!=plan->approximate_pre.padded_width||
+       value.padded_height!=plan->approximate_pre.padded_height||
+       value.windows!=uint64_t((value.padded_width+11)/8)*
+           ((value.padded_height+11)/8))return hipErrorInvalidValue;
+    const std::array<std::pair<uint64_t,uint64_t>,15> ranges{{
+        {value.main_scale_weight_offset,32ull*2},
+        {value.skip_scale_weight_offset,32ull*2},
+        {value.tail_weight_offset,32ull*4*2},
+        {value.ffn_expand_weight_offset,32ull*128},
+        {value.ffn_contract_weight_offset,128ull*32},
+        {value.ffn_scale_weight_offset,32ull*2},
+        {value.a_index_weight_offset,64ull*32*4},
+        {value.residual_index_weight_offset,64ull*32*4},
+        {value.ffn_permutation_weight_offset,32ull*4},
+        {value.qkv_weight_offset,32ull*96},
+        {value.qscale_weight_offset,2},
+        {value.permutation_weight_offset,32ull*4},
+        {value.position_bias_weight_offset,64ull*64*2},
+        {value.project_weight_offset,32ull*32},
+        {value.residual_scale_weight_offset,32ull*2}}};
+    for(const auto& range:ranges)
+        if(!range_fits(range.first,range.second,plan->desc.weight_bytes))
+            return hipErrorInvalidValue;
+    plan->approximate_head=value;plan->has_approximate_head=true;
+    refresh_complete_native_topology(plan);return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetApproxEdgeCompactQkv(NRPlan* plan,uint8_t enabled) {
+    if(!plan||enabled>1||plan->finalized||plan->record||plan->record_v3||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8)return hipErrorInvalidValue;
+    plan->approximate_edge_compact_qkv=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetApproxStandardCompactQkv(NRPlan* plan,uint8_t enabled) {
+    if(!plan||enabled>1||plan->finalized||plan->record||plan->record_v3||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8)return hipErrorInvalidValue;
+    plan->approximate_standard_compact_qkv=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetApproxFullFusedQkv(NRPlan* plan,uint8_t enabled) {
+    if(!plan||enabled>1||plan->finalized||plan->record||plan->record_v3||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8)return hipErrorInvalidValue;
+    plan->approximate_full_fused_qkv=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetApproxFusedQkvConsumesFp16(NRPlan* plan,uint8_t enabled) {
+    if(!plan||enabled>1||plan->finalized||plan->record||plan->record_v3||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8)return hipErrorInvalidValue;
+    plan->approximate_fused_qkv_consumes_fp16=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanSetApproxElideRedundantPostPublish(
+    NRPlan* plan,uint8_t enabled) {
+    if(!plan||enabled>1||plan->finalized||plan->record||plan->record_v3||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->precision!=NR_PRECISION_APPROX_FP8)return hipErrorInvalidValue;
+    plan->approximate_elide_redundant_post_publish=enabled!=0;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugConfigureApproxEncoderTransition(NRPlan* plan,
+    const NRApproxScaleTransitionDesc* descriptor) {
+    if(!plan||!descriptor||plan->finalized||plan->record||plan->record_v3||
+       plan->precision!=NR_PRECISION_APPROX_FP8||!plan->weights_uploaded||
+       plan->arena_regions.empty()||plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       !plan->approximate_scale_transitions.empty())return hipErrorInvalidValue;
+    const auto value=*descriptor;
+    if(value.struct_size!=sizeof(NRApproxScaleTransitionDesc)||
+       value.direction!=NR_TRANSITION_ENCODER_DOWNSAMPLE||
+       (value.channels!=32&&value.channels!=64&&value.channels!=128&&
+        value.channels!=256)||
+       !value.source_width||
+       !value.source_height||value.source_width!=value.target_width*2||
+       value.source_height!=value.target_height*2||
+       (value.source_width&7)||(value.source_height&7)||
+       (value.target_width&3)||(value.target_height&3)||
+       (value.source_origin_x!=0&&value.source_origin_x!=-4)||
+       (value.source_origin_y!=0&&value.source_origin_y!=-4)||
+       value.skip_scale_weight_offset)return hipErrorInvalidValue;
+    bool source_block=false,target_block=false;
+    for(const auto& block:plan->approximate_stage_blocks){
+        source_block|=block.record_number==value.anchor_record&&
+            block.channels==value.channels&&block.feature_width==value.source_width&&
+            block.feature_height==value.source_height;
+        target_block|=block.record_number>value.anchor_record&&
+            block.channels==value.channels*2&&block.feature_width==value.target_width&&
+            block.feature_height==value.target_height;
+    }
+    if(value.channels==256)
+        for(const auto& block:plan->approximate_split512_blocks)
+            target_block|=block.record_number>value.anchor_record&&
+                block.feature_width==value.target_width&&
+                block.feature_height==value.target_height;
+    if(!source_block||!target_block)return hipErrorInvalidValue;
+    const uint64_t source_windows=uint64_t((value.source_width-value.source_origin_x+7)/8)*
+        uint64_t((value.source_height-value.source_origin_y+7)/8);
+    const uint64_t source_fp16=source_windows*64*value.channels*2;
+    const uint64_t source_resident=uint64_t(value.source_width)*value.source_height*value.channels;
+    const uint64_t target=uint64_t(value.target_width)*value.target_height*value.channels*2;
+    if(!range_in_arena(plan,value.source_offset,source_fp16)||
+       !range_in_arena(plan,value.source_resident_offset,source_resident)||
+       !range_in_arena(plan,value.skip_offset,source_resident)||
+       !range_in_arena(plan,value.target_offset,target)||
+       !range_fits(value.project_weight_offset,uint64_t(value.channels)*value.channels*2,
+                   plan->desc.weight_bytes)||
+       !range_fits(value.permutation_weight_offset,uint64_t(value.channels)*4,
+                   plan->desc.weight_bytes))return hipErrorInvalidValue;
+    void* replacement_target{};void* replacement_skip{};
+    hipError_t error=hipMalloc(&replacement_target,size_t(target));
+    if(error==hipSuccess)error=hipMalloc(&replacement_skip,size_t(source_resident));
+    if(error!=hipSuccess){
+        if(replacement_target)(void)hipFree(replacement_target);
+        if(replacement_skip)(void)hipFree(replacement_skip);
+        return error;
+    }
+    if(plan->fixed_transition_target)(void)hipFree(plan->fixed_transition_target);
+    if(plan->fixed_transition_skip_pool)(void)hipFree(plan->fixed_transition_skip_pool);
+    plan->fixed_transition_target=replacement_target;
+    plan->fixed_transition_target_bytes=target;
+    plan->fixed_transition_skip_pool=replacement_skip;
+    plan->fixed_transition_skip_pool_bytes=source_resident;
+    plan->fixed_transition_skip_offsets={};plan->fixed_transition_skip_sizes={};
+    const uint32_t slot=value.channels==32?0:value.channels==64?1:
+        value.channels==128?2:3;
+    plan->fixed_transition_skip_sizes[slot]=source_resident;
+    plan->approximate_scale_transitions={value};
+    plan->complete_native_topology=false;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugAppendApproxDecoderTransition(NRPlan* plan,
+    const NRApproxScaleTransitionDesc* descriptor) {
+    if(!plan||!descriptor||plan->finalized||plan->record||plan->record_v3||
+       plan->precision!=NR_PRECISION_APPROX_FP8||!plan->weights_uploaded||
+       plan->execution_mode!=NR_EXECUTION_FIXED_SEQUENCE||
+       plan->approximate_scale_transitions.size()!=1||
+       plan->approximate_scale_transitions.front().direction!=
+           NR_TRANSITION_ENCODER_DOWNSAMPLE)return hipErrorInvalidValue;
+    const auto value=*descriptor;
+    const auto& encoder=plan->approximate_scale_transitions.front();
+    if(value.struct_size!=sizeof(NRApproxScaleTransitionDesc)||
+       value.direction!=NR_TRANSITION_DECODER_UPSAMPLE||
+       value.channels!=encoder.channels||value.anchor_record<=encoder.anchor_record||
+       value.source_width!=encoder.target_width||
+       value.source_height!=encoder.target_height||
+       value.target_width!=encoder.source_width||
+       value.target_height!=encoder.source_height||value.source_origin_x||
+       value.source_origin_y||value.source_offset!=value.source_resident_offset)
+        return hipErrorInvalidValue;
+    bool source_block=false,target_block=false;
+    for(const auto& block:plan->approximate_stage_blocks){
+        source_block|=block.record_number>encoder.anchor_record&&
+            block.record_number<value.anchor_record&&block.channels==value.channels*2&&
+            block.feature_width==value.source_width&&block.feature_height==value.source_height;
+        target_block|=block.record_number==value.anchor_record&&
+            block.channels==value.channels&&block.feature_width==value.target_width&&
+            block.feature_height==value.target_height;
+    }
+    if(value.channels==256)
+        for(const auto& block:plan->approximate_split512_blocks)
+            source_block|=block.record_number>encoder.anchor_record&&
+                block.record_number<value.anchor_record&&
+                block.feature_width==value.source_width&&
+                block.feature_height==value.source_height;
+    const uint64_t source=uint64_t(value.source_width)*value.source_height*value.channels*2;
+    const uint64_t skip=uint64_t(value.target_width)*value.target_height*value.channels;
+    const uint64_t target=skip;
+    if(!source_block||!target_block||
+       !range_in_arena(plan,value.source_offset,source)||
+       !range_in_arena(plan,value.skip_offset,skip)||
+       !range_in_arena(plan,value.target_offset,target)||
+       !range_fits(value.project_weight_offset,uint64_t(value.channels)*value.channels*2,
+                   plan->desc.weight_bytes)||
+       !range_fits(value.permutation_weight_offset,uint64_t(value.channels)*2*4,
+                   plan->desc.weight_bytes)||
+       !range_fits(value.skip_scale_weight_offset,uint64_t(value.channels)*2,
+                   plan->desc.weight_bytes))return hipErrorInvalidValue;
+    if(target>plan->fixed_transition_target_bytes){
+        void* replacement{};
+        hipError_t error=hipMalloc(&replacement,size_t(target));
+        if(error!=hipSuccess)return error;
+        if(plan->fixed_transition_target)(void)hipFree(plan->fixed_transition_target);
+        plan->fixed_transition_target=replacement;
+        plan->fixed_transition_target_bytes=target;
+    }
+    plan->approximate_scale_transitions.push_back(value);
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugGetFixedTransitionState(NRPlan* plan,
+    uint64_t* encoder_chains,uint64_t* decoder_chains,uint64_t* target_bytes,
+    uint64_t* skip_pool_bytes) {
+    if(!plan||!encoder_chains||!decoder_chains||!target_bytes||!skip_pool_bytes)
+        return hipErrorInvalidValue;
+    *encoder_chains=plan->fixed_transition_encoder_chains;
+    *decoder_chains=plan->fixed_transition_decoder_chains;
+    *target_bytes=plan->fixed_transition_target_bytes;
+    *skip_pool_bytes=plan->fixed_transition_skip_pool_bytes;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugGetFixedCentralState(NRPlan* plan,
+    uint64_t* encoder_chains,uint64_t* vit_block_chains,
+    uint64_t* decoder_chains,uint64_t* vit_scratch_bytes,
+    uint64_t* bottleneck_skip_bytes) {
+    if(!plan||!encoder_chains||!vit_block_chains||!decoder_chains||
+       !vit_scratch_bytes||!bottleneck_skip_bytes)return hipErrorInvalidValue;
+    *encoder_chains=plan->fixed_bottleneck_encoder_chains;
+    *vit_block_chains=plan->fixed_vit_block_chains;
+    *decoder_chains=plan->fixed_bottleneck_decoder_chains;
+    *vit_scratch_bytes=plan->fixed_vit_scratch_bytes;
+    *bottleneck_skip_bytes=plan->fixed_bottleneck_skip_bytes;
+    return hipSuccess;
+}
+
+NRPLAN_API hipError_t nrPlanDebugCopyFixedResidentToDevice(NRPlan* plan,
+    void* target,uint64_t bytes) {
+    const uint64_t available=plan?uint64_t(plan->fixed_resident_chain_width)*
+        plan->fixed_resident_chain_height*plan->fixed_resident_chain_channels:0;
+    if(!plan||!target||!plan->fixed_resident_chain_input||!bytes||bytes>available)
+        return hipErrorInvalidValue;
+    hipError_t error=hipStreamSynchronize(plan->stream);
+    if(error==hipSuccess)error=hipMemcpyAsync(target,plan->fixed_resident_chain_input,
+        size_t(bytes),hipMemcpyDeviceToDevice,plan->stream);
+    return error==hipSuccess?hipStreamSynchronize(plan->stream):error;
 }
 
 NRPLAN_API hipError_t nrPlanInitializeArenaFromDevice(NRPlan* plan,uint64_t offset,
@@ -977,6 +1619,7 @@ NRPLAN_API hipError_t nrPlanSetStaticIO(NRPlan* plan,void* static_input,
 
 static hipError_t record_approximate_stage_block(NRPlan* plan,
     const NRApproxStageBlockDesc& block) {
+    DiagnosticScope timing(plan,"C"+std::to_string(block.channels)+"/block"+std::to_string(block.record_number));
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
     auto error_from=[](int value){return static_cast<hipError_t>(value);};
@@ -1005,25 +1648,196 @@ static hipError_t record_approximate_stage_block(NRPlan* plan,
     void* output=workspace+block.output_fp16_offset;
     void* next=workspace+block.next_resident_offset;
     hipError_t error=hipErrorInvalidValue;
-#define RECORD_STAGE(C) \
-    error=error_from(nr_stage_c##C##_ffn_fp8(raw,expand,contract,mix,ffn_scale,ai,ri,ffn_permutation,inverse,grouped,seed,post,resident,int(block.windows),int(block.feature_width),int(block.feature_height),block.origin_x,block.origin_y,plan->stream)); \
-    if(error==hipSuccess)error=error_from(nr_stage_c##C##_qkv_norm_fp8(resident,qkv,qscale,permutation,qkv_projection,q,k,v,plan->stage_e4_lut,int(block.windows),plan->stream)); \
-    if(error==hipSuccess)error=error_from(nr_stage_c##C##_attention_fp8(q,k,v,bias,value,int(block.windows),plan->stream)); \
-    if(error==hipSuccess)error=error_from(nr_stage_c##C##_project_fp8(post,value,project,scale,permutation,output,resident,int(block.windows),plan->stream)); \
-    if(error==hipSuccess)error=error_from(nr_stage_c##C##_scatter_fp8(resident,next,int(block.feature_width),int(block.feature_height),block.origin_x,block.origin_y,plan->stream))
-    if(block.channels==32){RECORD_STAGE(32);}
-    else if(block.channels==64){RECORD_STAGE(64);}
-    else if(block.channels==128){RECORD_STAGE(128);}
-    else if(block.channels==256){RECORD_STAGE(256);}
-#undef RECORD_STAGE
+    NRStandardStageLaunch launch{raw,expand,contract,mix,ffn_scale,ai,ri,
+        ffn_permutation,inverse,grouped,seed,post,resident,qkv,qscale,permutation,
+        qkv_projection,q,k,v,plan->stage_e4_lut,bias,value,project,scale,output,next,
+        int(block.windows),int(block.feature_width),int(block.feature_height),block.origin_x,
+        block.origin_y,plan->debug_stop_after_standard_qkv?1:0,plan->recording_graph?0:1,
+        plan->stream};
+    if(fixed_resident_recording(plan)&&
+       (block.channels==32||block.channels==64||block.channels==128||
+        block.channels==256)){
+        const size_t scalars=size_t(block.windows)*64*block.channels;
+        if(!plan->fixed_boundary_scratch||plan->fixed_boundary_scratch_bytes<
+           scalars*7)return hipErrorInvalidValue;
+        ++plan->fixed_boundary_stage_entries;
+        auto* scratch=static_cast<uint8_t*>(plan->fixed_boundary_scratch);
+        const void* active_raw=raw;
+        if(plan->fixed_resident_chain_input&&
+           plan->fixed_resident_chain_channels==block.channels&&
+           plan->fixed_resident_chain_width==block.feature_width&&
+           plan->fixed_resident_chain_height==block.feature_height)
+            active_raw=plan->fixed_resident_chain_input;
+#define CALL_FFN(C) nr_stage_c##C##_ffn_fp8(active_raw,expand,contract,mix,ffn_scale,ai,ri, \
+            ffn_permutation,inverse,grouped,seed,post,scratch,plan->stage_e4_lut, \
+            int(block.windows),int(block.feature_width),int(block.feature_height), \
+            block.origin_x,block.origin_y,plan->fixed_sequence_host_boundaries?1:0,plan->stream)
+        if(block.channels==32)error=error_from(nr_stage_c32_ffn_fp8(active_raw,
+            expand,contract,mix,ffn_scale,ai,ri,ffn_permutation,inverse,grouped,seed,
+            post,scratch,int(block.windows),int(block.feature_width),
+            int(block.feature_height),block.origin_x,block.origin_y,plan->stream));
+        else if(block.channels==64)error=error_from(CALL_FFN(64));
+        else if(block.channels==128)error=error_from(CALL_FFN(128));
+        else error=error_from(CALL_FFN(256));
+#undef CALL_FFN
+        error=fixed_boundary(plan,error);
+        const bool publish_post=!plan->approximate_elide_redundant_post_publish&&
+            !(plan->approximate_full_fused_qkv&&
+              plan->approximate_fused_qkv_consumes_fp16);
+        if(error==hipSuccess&&publish_post)
+            error=error_from(nr_stage_debug_pack_e4x4_from_fp16(
+                post,scratch,plan->stage_e4_lut,scalars,plan->stream));
+        error=fixed_boundary(plan,error);
+        if(error==hipSuccess&&publish_post)++plan->fixed_boundary_post_copies;
+#define CALL_QKV(C) (plan->fixed_sequence_host_boundaries? \
+            nr_stage_c##C##_qkv_ordered_fp8(scratch,qkv,qscale,permutation, \
+                qkv_projection,scratch+scalars,scratch+scalars*2,scratch+scalars*3, \
+                plan->stage_e4_lut,int(block.windows),plan->stream): \
+            plan->approximate_full_fused_qkv? \
+            (plan->approximate_fused_qkv_consumes_fp16? \
+             nr_stage_c##C##_qkv_full_fused_from_fp16: \
+             nr_stage_c##C##_qkv_full_fused_fp8)( \
+                plan->approximate_fused_qkv_consumes_fp16?post:scratch, \
+                qkv,qscale,permutation, \
+                scratch+scalars,scratch+scalars*2,scratch+scalars*3, \
+                plan->stage_e4_lut,int(block.windows),plan->stream): \
+            (plan->approximate_standard_compact_qkv? \
+            nr_stage_c##C##_qkv_compact_publish_fp8: \
+            nr_stage_c##C##_qkv_norm_fp8)(scratch,qkv,qscale,permutation, \
+                qkv_projection,scratch+scalars,scratch+scalars*2,scratch+scalars*3, \
+                plan->stage_e4_lut,int(block.windows),plan->stream))
+        if(error==hipSuccess){
+            if(block.channels==32)error=error_from(CALL_QKV(32));
+            else if(block.channels==64)error=error_from(CALL_QKV(64));
+            else if(block.channels==128)error=error_from(CALL_QKV(128));
+            else error=error_from(CALL_QKV(256));
+        }
+#undef CALL_QKV
+        if(error==hipSuccess)++plan->fixed_boundary_qkv_copies;
+        if(error!=hipSuccess||plan->debug_stop_after_standard_qkv)return error;
+#define CALL_ATTENTION(C) nr_stage_c##C##_attention_fp8(scratch+scalars, \
+            scratch+scalars*2,scratch+scalars*3,bias,scratch+scalars*4, \
+            int(block.windows),plan->stream)
+        if(block.channels==32)error=error_from(CALL_ATTENTION(32));
+        else if(block.channels==64)error=error_from(CALL_ATTENTION(64));
+        else if(block.channels==128)error=error_from(CALL_ATTENTION(128));
+        else error=error_from(CALL_ATTENTION(256));
+#undef CALL_ATTENTION
+#define CALL_PROJECT(C) nr_stage_c##C##_project_fp8(post,scratch+scalars*4,project, \
+            scale,permutation,output,scratch+scalars*5,int(block.windows),plan->stream)
+        if(error==hipSuccess){
+            if(block.channels==32)error=error_from(CALL_PROJECT(32));
+            else if(block.channels==64)error=error_from(CALL_PROJECT(64));
+            else if(block.channels==128)error=error_from(CALL_PROJECT(128));
+            else error=error_from(CALL_PROJECT(256));
+        }
+#undef CALL_PROJECT
+        error=fixed_boundary(plan,error);
+        if(error==hipSuccess)error=error_from(nr_stage_debug_pack_e4x4_from_fp16(
+            output,scratch+scalars*5,plan->stage_e4_lut,scalars,plan->stream));
+        error=fixed_boundary(plan,error);
+#define CALL_SCATTER(C) nr_stage_c##C##_scatter_fp8(scratch+scalars*5,scratch+scalars*6, \
+            int(block.feature_width),int(block.feature_height),block.origin_x,block.origin_y, \
+            plan->stream)
+        if(error==hipSuccess){
+            if(block.channels==32)error=error_from(CALL_SCATTER(32));
+            else if(block.channels==64)error=error_from(CALL_SCATTER(64));
+            else if(block.channels==128)error=error_from(CALL_SCATTER(128));
+            else error=error_from(CALL_SCATTER(256));
+        }
+#undef CALL_SCATTER
+        if(error==hipSuccess){
+            plan->fixed_resident_chain_input=scratch+scalars*6;
+            plan->fixed_resident_chain_channels=block.channels;
+            plan->fixed_resident_chain_width=block.feature_width;
+            plan->fixed_resident_chain_height=block.feature_height;
+        }
+        return error;
+    }
+#define RECORD_STAGE_BLOCK(C) error=error_from(nr_stage_c##C##_block_launch(&launch))
+    if(block.channels==32){
+        error=error_from(nr_stage_c32_ffn_fp8(raw,expand,contract,mix,ffn_scale,ai,ri,
+            ffn_permutation,inverse,grouped,seed,post,resident,int(block.windows),
+            int(block.feature_width),int(block.feature_height),block.origin_x,block.origin_y,
+            plan->stream));
+        if(error==hipSuccess)error=error_from(nr_stage_c32_qkv_norm_fp8(resident,qkv,
+            qscale,permutation,qkv_projection,q,k,v,plan->stage_e4_lut,int(block.windows),
+            plan->stream));
+        if(error==hipSuccess&&!plan->debug_stop_after_standard_qkv)
+            error=error_from(nr_stage_c32_attention_fp8(q,k,v,bias,value,int(block.windows),
+                plan->stream));
+        if(error==hipSuccess&&!plan->debug_stop_after_standard_qkv)
+            error=error_from(nr_stage_c32_project_fp8(post,value,project,scale,permutation,
+                output,resident,int(block.windows),plan->stream));
+        if(error==hipSuccess&&!plan->debug_stop_after_standard_qkv)
+            error=error_from(nr_stage_c32_scatter_fp8(resident,next,int(block.feature_width),
+                int(block.feature_height),block.origin_x,block.origin_y,plan->stream));
+    }else if(block.channels==64){RECORD_STAGE_BLOCK(64);}
+    else if(block.channels==128){RECORD_STAGE_BLOCK(128);}
+    else if(block.channels==256){RECORD_STAGE_BLOCK(256);}
+#undef RECORD_STAGE_BLOCK
     return error;
 }
 
 static hipError_t record_approximate_split512_block(NRPlan* plan,
     const NRApproxSplit512BlockDesc& block) {
+    DiagnosticScope timing(plan,"C512/block"+std::to_string(block.record_number));
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
     auto error_from=[](int value){return static_cast<hipError_t>(value);};
+    if(fixed_resident_recording(plan)){
+        const size_t scalars=size_t(block.windows)*64*512;
+        if(!plan->fixed_boundary_scratch||plan->fixed_boundary_scratch_bytes<scalars*8)
+            return hipErrorInvalidValue;
+        auto* scratch=static_cast<uint8_t*>(plan->fixed_boundary_scratch);
+        const void* active_raw=workspace+block.raw_resident_offset;
+        if(plan->fixed_resident_chain_input&&
+           plan->fixed_resident_chain_channels==512&&
+           plan->fixed_resident_chain_width==block.feature_width&&
+           plan->fixed_resident_chain_height==block.feature_height)
+            active_raw=plan->fixed_resident_chain_input;
+        ++plan->fixed_boundary_stage_entries;
+        hipError_t error=error_from(nr_stage_c512_ffn_fp8(active_raw,
+            weights+block.preproject_weight_offset,weights+block.expand_weight_offset,
+            weights+block.contract_weight_offset,weights+block.ffn_project_weight_offset,
+            weights+block.ffn_scale_weight_offset,weights+block.a_index_weight_offset,
+            weights+block.residual_index_weight_offset,weights+block.perm64_weight_offset,
+            weights+block.perm256_weight_offset,weights+block.ffn_permutation_weight_offset,
+            scratch,scratch+scalars,workspace+block.post_fp16_offset,scratch+scalars*2,
+            int(block.windows),int(block.feature_width),int(block.feature_height),
+            block.origin_x,block.origin_y,plan->stream));
+        error=fixed_boundary(plan,error);
+        if(error==hipSuccess)++plan->fixed_boundary_post_copies;
+        if(error==hipSuccess)error=error_from(nr_stage_c512_qkv_norm_fp8(
+            scratch+scalars*2,weights+block.qkv_weight_offset,
+            weights+block.qscale_weight_offset,
+            weights+block.attention_permutation_weight_offset,scratch+scalars*3,
+            scratch+scalars*4,scratch+scalars*5,int(block.windows),plan->stream));
+        error=fixed_boundary(plan,error);
+        if(error==hipSuccess)++plan->fixed_boundary_qkv_copies;
+        if(error==hipSuccess)error=error_from(nr_stage_c512_attention_fp8(
+            scratch+scalars*3,scratch+scalars*4,scratch+scalars*5,
+            weights+block.position_bias_weight_offset,scratch+scalars*6,
+            int(block.windows),plan->stream));
+        if(error==hipSuccess)error=error_from(nr_stage_c512_project_fp8(
+            workspace+block.post_fp16_offset,scratch+scalars*6,
+            weights+block.attention_project_weight_offset,
+            weights+block.attention_scale_weight_offset,
+            weights+block.attention_permutation_weight_offset,
+            workspace+block.output_fp16_offset,scratch+scalars*2,
+            int(block.windows),plan->stream));
+        error=fixed_boundary(plan,error);
+        if(error==hipSuccess)error=error_from(nr_stage_c512_scatter_fp8(
+            scratch+scalars*2,scratch+scalars*7,int(block.feature_width),
+            int(block.feature_height),block.origin_x,block.origin_y,plan->stream));
+        if(error==hipSuccess){
+            plan->fixed_resident_chain_input=scratch+scalars*7;
+            plan->fixed_resident_chain_channels=512;
+            plan->fixed_resident_chain_width=block.feature_width;
+            plan->fixed_resident_chain_height=block.feature_height;
+        }
+        return error;
+    }
     void* projected=workspace+block.projected_offset;
     void* grouped=workspace+block.grouped_offset;
     void* post=workspace+block.post_fp16_offset;
@@ -1057,50 +1871,190 @@ static hipError_t record_approximate_split512_block(NRPlan* plan,
 
 static hipError_t record_approximate_vit_block(NRPlan* plan,
     const NRApproxVitBlockDesc& block) {
+    DiagnosticScope timing(plan,"ViT/block"+std::to_string(block.record_number));
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
-    return static_cast<hipError_t>(nr_vit_block_fp8(
-        workspace+block.input_offset,weights+block.expand_weight_offset,
+    const bool fixed=fixed_resident_recording(plan);
+    const uint64_t activation=uint64_t(block.tokens)*1024;
+    const void* input=workspace+block.input_offset;
+    void* hidden=workspace+block.hidden_offset;
+    void* post=workspace+block.post_offset;
+    void* q=workspace+block.q_offset;void* k=workspace+block.k_offset;
+    void* v=workspace+block.v_offset;void* value=workspace+block.value_offset;
+    void* next=workspace+block.next_offset;
+    if(fixed){
+        if(!plan->fixed_vit_scratch||plan->fixed_vit_scratch_bytes<activation*10||
+           !plan->fixed_resident_chain_input||
+           plan->fixed_resident_chain_channels!=1024||
+           uint64_t(plan->fixed_resident_chain_width)*
+               plan->fixed_resident_chain_height!=block.tokens)
+            return hipErrorInvalidValue;
+        auto* scratch=static_cast<uint8_t*>(plan->fixed_vit_scratch);
+        input=plan->fixed_resident_chain_input;hidden=scratch;
+        post=scratch+activation*4;q=scratch+activation*5;k=scratch+activation*6;
+        v=scratch+activation*7;value=scratch+activation*8;next=scratch+activation*9;
+    }
+    hipError_t error=static_cast<hipError_t>(nr_vit_block_fp8(
+        input,weights+block.expand_weight_offset,
         weights+block.contract_weight_offset,weights+block.qkv_weight_offset,
         weights+block.q_scale_weight_offset,weights+block.project_weight_offset,
         weights+block.ffn_scale_weight_offset,
         weights+block.attention_scale_weight_offset,
         weights+block.perm1024_weight_offset,weights+block.perm4096_weight_offset,
-        workspace+block.hidden_offset,workspace+block.post_offset,
-        workspace+block.q_offset,workspace+block.k_offset,workspace+block.v_offset,
-        workspace+block.value_offset,workspace+block.next_offset,int(block.tokens),
-        plan->stream));
+        hidden,post,q,k,v,value,next,int(block.tokens),plan->stream));
+    if(error==hipSuccess&&fixed){
+        plan->fixed_resident_chain_input=next;
+        ++plan->fixed_vit_block_chains;
+    }
+    return error;
 }
 
 static hipError_t record_encoder_bottleneck(NRPlan* plan) {
+    DiagnosticScope timing(plan,"Bottleneck/encoder");
     const auto& b=plan->approximate_bottleneck;
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
-    return static_cast<hipError_t>(nr_encoder_final_to_vit_fp8(
-        workspace+b.c512_input_offset,workspace+b.c512_skip_offset,
+    const bool fixed=fixed_resident_recording(plan);
+    const void* input=workspace+b.c512_input_offset;
+    void* skip=workspace+b.c512_skip_offset;
+    void* vit=workspace+b.vit_input_offset;
+    const uint64_t activation=uint64_t(b.tokens)*1024;
+    if(fixed){
+        if(!plan->fixed_resident_chain_input||
+           plan->fixed_resident_chain_channels!=512||
+           plan->fixed_resident_chain_width!=b.feature_width||
+           plan->fixed_resident_chain_height!=b.feature_height||
+           !plan->fixed_bottleneck_skip||
+           plan->fixed_bottleneck_skip_bytes<uint64_t(b.feature_width)*b.feature_height*512||
+           !plan->fixed_vit_scratch||plan->fixed_vit_scratch_bytes<activation*10)
+            return hipErrorInvalidValue;
+        input=plan->fixed_resident_chain_input;skip=plan->fixed_bottleneck_skip;
+        vit=static_cast<uint8_t*>(plan->fixed_vit_scratch)+activation*9;
+    }
+    hipError_t error=static_cast<hipError_t>(nr_encoder_final_to_vit_fp8(
+        input,skip,
         weights+b.encoder_weight_offset,weights+b.encoder_permutation_offset,
-        workspace+b.vit_input_offset,int(b.feature_width),int(b.feature_height),
+        vit,int(b.feature_width),int(b.feature_height),
         int(b.low_width),int(b.low_height),plan->stream));
+    if(error==hipSuccess&&fixed){
+        plan->fixed_resident_chain_input=vit;
+        plan->fixed_resident_chain_channels=1024;
+        plan->fixed_resident_chain_width=b.low_width;
+        plan->fixed_resident_chain_height=b.low_height;
+        ++plan->fixed_bottleneck_encoder_chains;
+    }
+    return error;
 }
 
 static hipError_t record_decoder_bottleneck(NRPlan* plan) {
+    DiagnosticScope timing(plan,"Bottleneck/decoder");
     const auto& b=plan->approximate_bottleneck;
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
-    return static_cast<hipError_t>(nr_decoder_input_from_vit_fp8(
-        workspace+b.vit_output_offset,workspace+b.c512_skip_offset,
+    const bool fixed=fixed_resident_recording(plan);
+    const void* vit=workspace+b.vit_output_offset;
+    const void* skip=workspace+b.c512_skip_offset;
+    void* output=workspace+b.c512_output_offset;
+    if(fixed){
+        if(!plan->fixed_resident_chain_input||
+           plan->fixed_resident_chain_channels!=1024||
+           plan->fixed_resident_chain_width!=b.low_width||
+           plan->fixed_resident_chain_height!=b.low_height||
+           !plan->fixed_bottleneck_skip||!plan->fixed_transition_target||
+           plan->fixed_transition_target_bytes<
+               uint64_t(b.feature_width)*b.feature_height*512)
+            return hipErrorInvalidValue;
+        vit=plan->fixed_resident_chain_input;skip=plan->fixed_bottleneck_skip;
+        output=plan->fixed_transition_target;
+    }
+    hipError_t error=static_cast<hipError_t>(nr_decoder_input_from_vit_fp8(
+        vit,skip,
         weights+b.decoder_weight_offset,weights+b.decoder_scale_offset,
-        weights+b.decoder_permutation_offset,workspace+b.c512_output_offset,
+        weights+b.decoder_permutation_offset,output,
         int(b.feature_width),int(b.feature_height),int(b.low_width),
         int(b.low_height),plan->stream));
+    if(error==hipSuccess&&fixed){
+        plan->fixed_resident_chain_input=output;
+        plan->fixed_resident_chain_channels=512;
+        plan->fixed_resident_chain_width=b.feature_width;
+        plan->fixed_resident_chain_height=b.feature_height;
+        ++plan->fixed_bottleneck_decoder_chains;
+    }
+    return error;
 }
 
 static hipError_t record_scale_transition(NRPlan* plan,
     const NRApproxScaleTransitionDesc& transition) {
+    DiagnosticScope timing(plan,"Transition/C"+std::to_string(transition.channels)+"/direction"+std::to_string(transition.direction)+"/anchor"+std::to_string(transition.anchor_record));
     auto* workspace=static_cast<uint8_t*>(plan->workspace);
     auto* weights=static_cast<uint8_t*>(plan->weights);
+    const uint32_t slot=transition.channels==32?0:transition.channels==64?1:
+        transition.channels==128?2:3;
+    auto clear_chain=[&](){
+        plan->fixed_resident_chain_input=nullptr;
+        plan->fixed_resident_chain_channels=0;
+        plan->fixed_resident_chain_width=0;
+        plan->fixed_resident_chain_height=0;
+    };
+    const bool fixed=fixed_resident_recording(plan);
+    // All four scale families publish into the same resident ABI. The C512
+    // split recorder consumes the channel-256 transition target directly.
+    if(fixed&&transition.direction==NR_TRANSITION_ENCODER_DOWNSAMPLE&&
+       (transition.channels==32||transition.channels==64||transition.channels==128||
+        transition.channels==256)&&
+       plan->fixed_resident_chain_input&&plan->fixed_transition_target&&
+       plan->fixed_transition_skip_pool&&
+       plan->fixed_resident_chain_channels==transition.channels&&
+       plan->fixed_resident_chain_width==transition.source_width&&
+       plan->fixed_resident_chain_height==transition.source_height){
+        auto* skip=static_cast<uint8_t*>(plan->fixed_transition_skip_pool)+
+            plan->fixed_transition_skip_offsets[slot];
+        hipError_t error=static_cast<hipError_t>(nr_transition_encoder_fp8(
+            workspace+transition.source_offset,plan->fixed_resident_chain_input,skip,
+            weights+transition.project_weight_offset,
+            weights+transition.permutation_weight_offset,
+            plan->fixed_transition_target,int(transition.source_width),
+            int(transition.source_height),transition.source_origin_x,
+            transition.source_origin_y,int(transition.channels),plan->stream));
+        if(error==hipSuccess){
+            plan->fixed_resident_chain_input=plan->fixed_transition_target;
+            plan->fixed_resident_chain_channels=transition.channels*2;
+            plan->fixed_resident_chain_width=transition.target_width;
+            plan->fixed_resident_chain_height=transition.target_height;
+            ++plan->fixed_transition_encoder_chains;
+        }else clear_chain();
+        return error;
+    }
+    if(fixed&&transition.direction==NR_TRANSITION_DECODER_UPSAMPLE&&
+       (transition.channels==32||transition.channels==64||transition.channels==128||
+        transition.channels==256)&&
+       plan->fixed_resident_chain_input&&plan->fixed_transition_target&&
+       plan->fixed_transition_skip_pool&&
+       plan->fixed_transition_skip_sizes[slot]&&
+       plan->fixed_resident_chain_channels==transition.channels*2&&
+       plan->fixed_resident_chain_width==transition.source_width&&
+       plan->fixed_resident_chain_height==transition.source_height){
+        auto* skip=static_cast<uint8_t*>(plan->fixed_transition_skip_pool)+
+            plan->fixed_transition_skip_offsets[slot];
+        hipError_t error=static_cast<hipError_t>(nr_transition_decoder_fp8(
+            plan->fixed_resident_chain_input,skip,
+            weights+transition.project_weight_offset,
+            weights+transition.skip_scale_weight_offset,
+            weights+transition.permutation_weight_offset,
+            plan->fixed_transition_target,int(transition.target_width),
+            int(transition.target_height),int(transition.channels),plan->stream));
+        if(error==hipSuccess){
+            plan->fixed_resident_chain_input=plan->fixed_transition_target;
+            plan->fixed_resident_chain_channels=transition.channels;
+            plan->fixed_resident_chain_width=transition.target_width;
+            plan->fixed_resident_chain_height=transition.target_height;
+            ++plan->fixed_transition_decoder_chains;
+        }else clear_chain();
+        return error;
+    }
+    hipError_t error=hipErrorInvalidValue;
     if(transition.direction==NR_TRANSITION_ENCODER_DOWNSAMPLE)
-        return static_cast<hipError_t>(nr_transition_encoder_fp8(
+        error=static_cast<hipError_t>(nr_transition_encoder_fp8(
             workspace+transition.source_offset,workspace+transition.source_resident_offset,
             workspace+transition.skip_offset,
             weights+transition.project_weight_offset,
@@ -1108,15 +2062,16 @@ static hipError_t record_scale_transition(NRPlan* plan,
             workspace+transition.target_offset,int(transition.source_width),
             int(transition.source_height),transition.source_origin_x,
             transition.source_origin_y,int(transition.channels),plan->stream));
-    if(transition.direction==NR_TRANSITION_DECODER_UPSAMPLE)
-        return static_cast<hipError_t>(nr_transition_decoder_fp8(
+    else if(transition.direction==NR_TRANSITION_DECODER_UPSAMPLE)
+        error=static_cast<hipError_t>(nr_transition_decoder_fp8(
             workspace+transition.source_offset,workspace+transition.skip_offset,
             weights+transition.project_weight_offset,
             weights+transition.skip_scale_weight_offset,
             weights+transition.permutation_weight_offset,
             workspace+transition.target_offset,int(transition.target_width),
             int(transition.target_height),int(transition.channels),plan->stream));
-    return hipErrorInvalidValue;
+    if(fixed)clear_chain();
+    return error;
 }
 
 static hipError_t record_scale_transition_at(NRPlan* plan,uint32_t record,
@@ -1127,7 +2082,139 @@ static hipError_t record_scale_transition_at(NRPlan* plan,uint32_t record,
     return hipSuccess;
 }
 
+struct EdgeC32Views {
+    uint8_t* raw{};
+    void* post{};
+    uint8_t* post_resident{};
+    void* qkv_projection{};
+    uint8_t* q{};
+    uint8_t* k{};
+    uint8_t* v{};
+    uint8_t* value{};
+    void* output{};
+};
+
+static EdgeC32Views edge_c32_views(NRPlan* plan) {
+    EdgeC32Views result{};
+    if(!plan||!plan->fixed_edge_scratch||!plan->fixed_edge_scratch_bytes||
+       plan->fixed_edge_scratch_bytes%12)return result;
+    auto* base=static_cast<uint8_t*>(plan->fixed_edge_scratch);
+    const uint64_t stride=plan->fixed_edge_scratch_bytes/12;
+    result.post=base;result.post_resident=base+stride*2;
+    result.qkv_projection=base+stride*3;
+    // Raw is dead before Q/K/V publication, so Q may overwrite it.
+    result.raw=base+stride*9;result.q=base+stride*9;
+    result.k=base+stride*10;result.v=base+stride*11;
+    // Projection is dead after Q/K/V publication. Attention value and the
+    // later FP16 output reuse its first three lanes.
+    result.value=base+stride*3;result.output=base+stride*4;return result;
+}
+
+static hipError_t record_approximate_pre(NRPlan* plan) {
+    DiagnosticScope timing(plan,"Pre/block0");
+    if(!plan->has_approximate_pre||!plan->device_bindings_v3||
+       !plan->fixed_pre_skip||!plan->fixed_transition_target)return hipErrorInvalidValue;
+    const auto& p=plan->approximate_pre;const uint64_t scalars=uint64_t(p.windows)*64*32;
+    if(plan->fixed_edge_scratch_bytes<scalars*12||
+       plan->fixed_pre_skip_bytes<uint64_t(p.padded_width)*p.padded_height*32||
+       plan->fixed_transition_target_bytes<uint64_t(p.padded_width/2)*(p.padded_height/2)*32)
+        return hipErrorInvalidValue;
+    EdgeC32Views v=edge_c32_views(plan);auto* w=static_cast<uint8_t*>(plan->weights);
+    auto convert=[](int value){return static_cast<hipError_t>(value);};
+    hipError_t error=convert(nr_io_pre_project_pack_v3(plan->device_bindings_v3,
+        w+p.input_project_weight_offset,v.raw,int(p.padded_width),int(p.padded_height),
+        p.color_scale,p.conditioning,p.frame_seed_xor,plan->stream));
+    if(error==hipSuccess)error=convert(nr_stage_c32_ffn_fp8(v.raw,
+        w+p.ffn_expand_weight_offset,w+p.ffn_contract_weight_offset,nullptr,
+        w+p.ffn_scale_weight_offset,w+p.a_index_weight_offset,
+        w+p.residual_index_weight_offset,w+p.ffn_permutation_weight_offset,
+        w+p.ffn_inverse_permutation_weight_offset,nullptr,nullptr,v.post,
+        v.post_resident,int(p.windows),int(p.padded_width),int(p.padded_height),0,0,
+        plan->stream));
+    if(error==hipSuccess){
+        if(plan->approximate_full_fused_qkv)
+            error=convert((plan->approximate_fused_qkv_consumes_fp16?
+                nr_stage_c32_qkv_full_fused_from_fp16:
+                nr_stage_c32_qkv_full_fused_fp8)(
+                plan->approximate_fused_qkv_consumes_fp16?v.post:v.post_resident,
+                w+p.qkv_weight_offset,w+p.qscale_weight_offset,w+p.permutation_weight_offset,
+                v.q,v.k,v.v,plan->stage_e4_lut,int(p.windows),plan->stream));
+        else error=convert((plan->approximate_edge_compact_qkv?
+            nr_stage_c32_qkv_compact_publish_fp8:nr_stage_c32_qkv_norm_fp8)(
+            v.post_resident,w+p.qkv_weight_offset,w+p.qscale_weight_offset,
+            w+p.permutation_weight_offset,v.qkv_projection,v.q,v.k,v.v,
+            plan->stage_e4_lut,int(p.windows),plan->stream));
+    }
+    if(error==hipSuccess)error=convert(nr_stage_c32_attention_fp8(v.q,v.k,v.v,
+        w+p.position_bias_weight_offset,v.value,int(p.windows),plan->stream));
+    if(error==hipSuccess)error=convert(nr_stage_c32_project_fp8(v.post,v.value,
+        w+p.project_weight_offset,w+p.residual_scale_weight_offset,
+        w+p.permutation_weight_offset,v.output,v.post_resident,int(p.windows),plan->stream));
+    if(error==hipSuccess)error=convert(nr_io_pre_pool_fp8(v.output,plan->fixed_pre_skip,
+        plan->fixed_transition_target,int(p.padded_width),int(p.padded_height),plan->stream));
+    if(error==hipSuccess){
+        plan->fixed_resident_chain_input=plan->fixed_transition_target;
+        plan->fixed_resident_chain_channels=32;
+        plan->fixed_resident_chain_width=p.padded_width/2;
+        plan->fixed_resident_chain_height=p.padded_height/2;
+    }
+    return error;
+}
+
+static hipError_t record_approximate_head(NRPlan* plan) {
+    DiagnosticScope timing(plan,"Head/block70");
+    if(!plan->has_approximate_head||!plan->device_bindings_v3||
+       !plan->fixed_pre_skip||!plan->fixed_resident_chain_input||
+       plan->fixed_resident_chain_channels!=32)return hipErrorInvalidValue;
+    const auto& h=plan->approximate_head;const uint64_t scalars=uint64_t(h.windows)*64*32;
+    if(plan->fixed_edge_scratch_bytes<scalars*12||
+       plan->fixed_resident_chain_width!=h.padded_width/2||
+       plan->fixed_resident_chain_height!=h.padded_height/2)return hipErrorInvalidValue;
+    EdgeC32Views v=edge_c32_views(plan);auto* w=static_cast<uint8_t*>(plan->weights);
+    auto convert=[](int value){return static_cast<hipError_t>(value);};
+    hipError_t error=convert(nr_io_head_input_fp8(plan->fixed_resident_chain_input,
+        plan->fixed_pre_skip,w+h.main_scale_weight_offset,w+h.skip_scale_weight_offset,
+        v.raw,int(h.padded_width),int(h.padded_height),plan->stream));
+    if(error==hipSuccess)error=convert(nr_stage_head_c32_ffn_fp8(v.raw,
+        w+h.ffn_expand_weight_offset,w+h.ffn_contract_weight_offset,
+        w+h.ffn_scale_weight_offset,w+h.a_index_weight_offset,
+        w+h.residual_index_weight_offset,w+h.ffn_permutation_weight_offset,
+        v.post,v.post_resident,int(h.windows),plan->stream));
+    if(error==hipSuccess){
+        if(plan->approximate_full_fused_qkv)
+            error=convert((plan->approximate_fused_qkv_consumes_fp16?
+                nr_stage_c32_qkv_full_fused_from_fp16:
+                nr_stage_c32_qkv_full_fused_fp8)(
+                plan->approximate_fused_qkv_consumes_fp16?v.post:v.post_resident,
+                w+h.qkv_weight_offset,w+h.qscale_weight_offset,w+h.permutation_weight_offset,
+                v.q,v.k,v.v,plan->stage_e4_lut,int(h.windows),plan->stream));
+        else error=convert((plan->approximate_edge_compact_qkv?
+            nr_stage_c32_qkv_compact_publish_fp8:nr_stage_c32_qkv_norm_fp8)(
+            v.post_resident,w+h.qkv_weight_offset,w+h.qscale_weight_offset,
+            w+h.permutation_weight_offset,v.qkv_projection,v.q,v.k,v.v,
+            plan->stage_e4_lut,int(h.windows),plan->stream));
+    }
+    if(error==hipSuccess)error=convert(nr_stage_c32_attention_fp8(v.q,v.k,v.v,
+        w+h.position_bias_weight_offset,v.value,int(h.windows),plan->stream));
+    if(error==hipSuccess)error=convert(nr_stage_c32_project_fp8(v.post,v.value,
+        w+h.project_weight_offset,w+h.residual_scale_weight_offset,
+        w+h.permutation_weight_offset,v.output,v.post_resident,int(h.windows),plan->stream));
+    if(error==hipSuccess)error=convert(nr_io_head_tail_v3(v.output,
+        w+h.tail_weight_offset,plan->device_bindings_v3,uint64_t(h.windows)*64,
+        int(h.padded_width),plan->stream));
+    return error;
+}
+
 static hipError_t record_approximate_stage_blocks(NRPlan* plan) {
+    if(fixed_resident_recording(plan)){
+        plan->fixed_resident_chain_input=nullptr;
+        plan->fixed_resident_chain_channels=0;
+        plan->fixed_resident_chain_width=0;
+        plan->fixed_resident_chain_height=0;
+    }
+    if(plan->has_approximate_pre){
+        hipError_t error=record_approximate_pre(plan);if(error!=hipSuccess)return error;
+    }
     size_t wide=0,split=0,vit=0;
     while(wide<plan->approximate_stage_blocks.size()||
           split<plan->approximate_split512_blocks.size()||
@@ -1166,30 +2253,37 @@ static hipError_t record_approximate_stage_blocks(NRPlan* plan) {
             error=record_decoder_bottleneck(plan);if(error!=hipSuccess)return error;
         }
     }
-    return hipSuccess;
+    return plan->has_approximate_head?record_approximate_head(plan):hipSuccess;
 }
 
 NRPLAN_API hipError_t nrPlanFinalize(NRPlan* plan) {
     const bool builtin=plan&&(!plan->approximate_stage_blocks.empty()||
                              !plan->approximate_split512_blocks.empty()||
                              !plan->approximate_vit_blocks.empty()||
-                             plan->has_approximate_bottleneck);
+                             plan->has_approximate_bottleneck||
+                             plan->has_approximate_pre||plan->has_approximate_head);
     if(!plan||(!plan->record&&!plan->record_v3&&!builtin)||plan->finalized||
        !plan->weights_uploaded||((plan->record_v3||builtin)&&!plan->prepared))return hipErrorInvalidValue;
     hipError_t error=hipStreamBeginCapture(plan->stream,hipStreamCaptureModeGlobal);
     if(error!=hipSuccess)return error;
+    plan->recording_graph=true;
     error=builtin?record_approximate_stage_blocks(plan):plan->record_v3?
         plan->record_v3(plan->stream,plan->workspace,plan->weights,
             plan->device_bindings_v3,plan->record_user):
         plan->record(plan->stream,plan->workspace,plan->weights,
             plan->device_bindings,plan->record_user);
+    plan->recording_graph=false;
     hipGraph_t graph{};
     hipError_t end_error=hipStreamEndCapture(plan->stream,&graph);
     if(error!=hipSuccess){if(graph)hipGraphDestroy(graph);return error;}
     if(end_error!=hipSuccess)return end_error;
+    error=instrument_operation_timing(plan,graph);
+    if(error!=hipSuccess){hipGraphDestroy(graph);return error;}
     hipGraphExec_t executable{};
     error=instantiate_graph(graph,&executable);
     if(error!=hipSuccess){hipGraphDestroy(graph);return error;}
+    error=refresh_executable_kernel_params(graph,executable);
+    if(error!=hipSuccess){hipGraphExecDestroy(executable);hipGraphDestroy(graph);return error;}
     plan->graph=graph;plan->owns_graph=true;
     plan->external_graph_allocations=false;
     plan->executable=executable;plan->finalized=true;
@@ -1223,7 +2317,16 @@ NRPLAN_API hipError_t nrPlanSubmit(NRPlan* plan,const NRFrameBindings* bindings,
         error=hipMemcpyAsync(plan->static_input,bindings->input,size_t(plan->input_bytes),
             hipMemcpyDeviceToDevice,plan->stream);
     if(error==hipSuccess)error=hipEventRecord(plan->timing_start,plan->stream);
-    if(error==hipSuccess)error=hipGraphLaunch(plan->executable,plan->stream);
+    if(error==hipSuccess){
+        const bool builtin=!plan->approximate_stage_blocks.empty()||
+            !plan->approximate_split512_blocks.empty()||!plan->approximate_vit_blocks.empty()||
+            plan->has_approximate_bottleneck||plan->has_approximate_pre||
+            plan->has_approximate_head;
+        if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE&&builtin&&
+           plan->fixed_sequence_host_boundaries){
+            ++plan->fixed_sequence_submits;error=record_approximate_stage_blocks(plan);
+        }else error=hipGraphLaunch(plan->executable,plan->stream);
+    }
     if(error==hipSuccess&&plan->static_output)
         error=hipMemcpyAsync(bindings->output,plan->static_output,size_t(plan->output_bytes),
             hipMemcpyDeviceToDevice,plan->stream);
@@ -1297,7 +2400,16 @@ static hipError_t submit_v3(NRPlan* plan,const NRFrameBindingsV3* bindings,
         plan->pinned_bindings_v3,sizeof(NRFrameBindingsV3),hipMemcpyHostToDevice,plan->stream);
     if(error==hipSuccess)error=hipEventRecord(plan->binding_consumed,plan->stream);
     if(error==hipSuccess)error=hipEventRecord(plan->timing_start,plan->stream);
-    if(error==hipSuccess)error=hipGraphLaunch(plan->executable,plan->stream);
+    if(error==hipSuccess){
+        const bool builtin=!plan->approximate_stage_blocks.empty()||
+            !plan->approximate_split512_blocks.empty()||!plan->approximate_vit_blocks.empty()||
+            plan->has_approximate_bottleneck||plan->has_approximate_pre||
+            plan->has_approximate_head;
+        if(plan->execution_mode==NR_EXECUTION_FIXED_SEQUENCE&&builtin&&
+           plan->fixed_sequence_host_boundaries){
+            ++plan->fixed_sequence_submits;error=record_approximate_stage_blocks(plan);
+        }else error=hipGraphLaunch(plan->executable,plan->stream);
+    }
     if(error==hipSuccess)error=hipEventRecord(plan->timing_stop,plan->stream);
     if(error==hipSuccess&&sync){
         hipExternalSemaphoreSignalParams signal{};signal.params.fence.value=sync->output_value;
@@ -1330,7 +2442,32 @@ NRPLAN_API hipError_t nrPlanReset(NRPlan* plan) {
     if(!plan)return hipErrorInvalidValue;
     hipError_t error=hipStreamSynchronize(plan->stream);
     if(error==hipSuccess)error=hipMemsetAsync(plan->workspace,0,size_t(plan->desc.workspace_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_boundary_scratch)
+        error=hipMemsetAsync(plan->fixed_boundary_scratch,0,
+            size_t(plan->fixed_boundary_scratch_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_transition_target)
+        error=hipMemsetAsync(plan->fixed_transition_target,0,
+            size_t(plan->fixed_transition_target_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_transition_skip_pool)
+        error=hipMemsetAsync(plan->fixed_transition_skip_pool,0,
+            size_t(plan->fixed_transition_skip_pool_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_bottleneck_skip)
+        error=hipMemsetAsync(plan->fixed_bottleneck_skip,0,
+            size_t(plan->fixed_bottleneck_skip_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_vit_scratch)
+        error=hipMemsetAsync(plan->fixed_vit_scratch,0,
+            size_t(plan->fixed_vit_scratch_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_edge_scratch)
+        error=hipMemsetAsync(plan->fixed_edge_scratch,0,
+            size_t(plan->fixed_edge_scratch_bytes),plan->stream);
+    if(error==hipSuccess&&plan->fixed_pre_skip)
+        error=hipMemsetAsync(plan->fixed_pre_skip,0,
+            size_t(plan->fixed_pre_skip_bytes),plan->stream);
     if(error==hipSuccess)error=hipStreamSynchronize(plan->stream);
+    plan->fixed_resident_chain_input=nullptr;
+    plan->fixed_resident_chain_channels=0;
+    plan->fixed_resident_chain_width=0;
+    plan->fixed_resident_chain_height=0;
     plan->submitted=false;
     return error;
 }

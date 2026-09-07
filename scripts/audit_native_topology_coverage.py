@@ -29,7 +29,7 @@ def family(number: int) -> str:
 
 
 def audit(wide: dict, split: dict, vit: dict, bottleneck: dict,
-          transitions: dict) -> dict:
+          transitions: dict, edges: dict | None = None) -> dict:
     if wide.get('status') != 'PARTIAL_NATIVE_SWIN32_256_BLOCKS_NOT_RUNTIME_ACCEPTED' or \
             wide.get('block_count') != 44 or wide.get('complete_native_topology'):
         raise ValueError('invalid standard wide topology')
@@ -67,6 +67,16 @@ def audit(wide: dict, split: dict, vit: dict, bottleneck: dict,
     expected = list(range(1, 70))
     if numbers != expected:
         raise ValueError('unexpected native stage block coverage')
+    edge_nodes=0
+    if edges is not None:
+        if edges.get('status')!='FULL_NATIVE_SINGLE_COLOR_EDGES_NOT_RUNTIME_ACCEPTED' or \
+                edges.get('temporal_contract_verified') is not False:
+            raise ValueError('invalid single-color edge topology')
+        if edges.get('target_arch')!=wide.get('target_arch') or \
+                edges.get('resolution')!=wide.get('resolution') or \
+                edges.get('precision_profile')!=wide.get('precision_profile'):
+            raise ValueError('edge topology target mismatch')
+        numbers.extend((0,70));numbers.sort();edge_nodes=edges['graph_kernel_nodes_if_recorded']
     missing = [number for number in range(71) if number not in set(numbers)]
     missing_by_family = {}
     for number in missing:
@@ -75,29 +85,37 @@ def audit(wide: dict, split: dict, vit: dict, bottleneck: dict,
              split['graph_kernel_nodes_if_recorded'] +
              vit['graph_kernel_nodes_if_recorded'] +
              bottleneck['graph_kernel_nodes_if_recorded'] +
-             transitions['graph_kernel_nodes_if_recorded'])
+             transitions['graph_kernel_nodes_if_recorded']+edge_nodes)
+    complete=edges is not None and not missing
     return {
         'schema': 1,
-        'status': 'PARTIAL_69_OF_71_NATIVE_RECORDS_WITH_SCALE_TRANSITIONS_NOT_RUNTIME_ACCEPTED',
+        'status': ('FULL_71_NATIVE_SINGLE_COLOR_RESET_TOPOLOGY_NOT_RUNTIME_ACCEPTED'
+                   if complete else
+                   'PARTIAL_69_OF_71_NATIVE_RECORDS_WITH_SCALE_TRANSITIONS_NOT_RUNTIME_ACCEPTED'),
         'target_arch': wide['target_arch'],
         'resolution': wide['resolution'],
         'precision_profile': wide['precision_profile'],
         'native_block_count': len(numbers),
         'native_record_numbers': numbers,
-        'theoretical_graph_kernel_nodes': nodes,
+        # Descriptor generators count conceptual launches. Several exported
+        # stage entries expand to multiple HIP kernels, so this is not an
+        # observed graph-node count and must never be used for acceptance.
+        'conceptual_launch_count_not_graph_nodes': nodes,
         'theoretical_graph_memcpy_nodes': (bottleneck['graph_memcpy_nodes_if_recorded'] +
                                            transitions['graph_memcpy_nodes_if_recorded']),
         'kernel_node_budget_limit': 512,
-        'remaining_kernel_node_budget': 512 - nodes,
+        'kernel_node_budget_evaluated': False,
         'missing_block_count': len(missing),
         'missing_record_numbers': missing,
         'missing_by_family': missing_by_family,
-        'unimplemented_record_subpaths': {
+        'unimplemented_record_subpaths': ({
             'pre_temporal_import_and_swin': [0],
             'head_and_history_export': [70],
-        },
+        } if not complete else {'original_temporal_import_and_history_export': [0,70]}),
         'native_scale_transition_count': transitions['transition_count'],
-        'complete_native_topology': False,
+        'complete_native_topology': complete,
+        'single_color_reset_only': complete,
+        'temporal_contract_verified': False,
         'graph_captured': False,
         'gpu_executed': False,
         'runtime_accepted': False,
@@ -111,17 +129,20 @@ def main() -> None:
     parser.add_argument('--vit', type=Path, required=True)
     parser.add_argument('--bottleneck', type=Path, required=True)
     parser.add_argument('--transitions', type=Path, required=True)
+    parser.add_argument('--edges', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     result = audit(json.loads(args.wide.read_text(encoding='utf-8')),
                    json.loads(args.split512.read_text(encoding='utf-8')),
                    json.loads(args.vit.read_text(encoding='utf-8')),
                    json.loads(args.bottleneck.read_text(encoding='utf-8')),
-                   json.loads(args.transitions.read_text(encoding='utf-8')))
+                   json.loads(args.transitions.read_text(encoding='utf-8')),
+                   None if args.edges is None else json.loads(args.edges.read_text(encoding='utf-8')))
     with args.output.open('x', encoding='utf-8') as stream:
         json.dump(result, stream, indent=2)
     print(json.dumps({key: result[key] for key in
-                      ('status', 'native_block_count', 'theoretical_graph_kernel_nodes',
+                      ('status', 'native_block_count',
+                       'conceptual_launch_count_not_graph_nodes',
                        'missing_by_family')}, indent=2))
 
 

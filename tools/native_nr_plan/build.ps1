@@ -14,9 +14,10 @@ try{
   $vitSource=Join-Path $PSScriptRoot '..\native_vit_fp8\vit_fp8.hip'
   $bottleneckSource=Join-Path $PSScriptRoot '..\native_bottleneck_fp8\bottleneck_fp8.hip'
   $transitionSource=Join-Path $PSScriptRoot '..\native_transition_fp8\transition_fp8.hip'
-  & $info.clangxx @common "$PSScriptRoot/nr_plan.cpp" $stageSource $vitSource $bottleneckSource $transitionSource @link '-shared' '-o' "$OutputDirectory/nr_plan.dll"
+  $ioSource=Join-Path $PSScriptRoot '..\native_io_fp8\io_fp8.hip'
+  & $info.clangxx @common "$PSScriptRoot/nr_plan.cpp" $stageSource $vitSource $bottleneckSource $transitionSource $ioSource @link '-shared' '-o' "$OutputDirectory/nr_plan.dll"
   if($LASTEXITCODE-ne 0){throw 'NRPlan DLL compile failed'}
-  & $info.clangxx @common "$PSScriptRoot/nr_plan.cpp" $stageSource $vitSource $bottleneckSource $transitionSource "$PSScriptRoot/selftest.hip" @link '-o' "$OutputDirectory/nr_plan_selftest.exe"
+  & $info.clangxx @common "$PSScriptRoot/nr_plan.cpp" $stageSource $vitSource $bottleneckSource $transitionSource $ioSource "$PSScriptRoot/selftest.hip" @link '-o' "$OutputDirectory/nr_plan_selftest.exe"
   if($LASTEXITCODE-ne 0){throw 'NRPlan selftest compile failed'}
-  [ordered]@{source_sha256=@{header=(Get-FileHash "$PSScriptRoot/nr_plan.h").Hash;runtime=(Get-FileHash "$PSScriptRoot/nr_plan.cpp").Hash;stage_fp8=(Get-FileHash $stageSource).Hash;vit_fp8=(Get-FileHash $vitSource).Hash;bottleneck_fp8=(Get-FileHash $bottleneckSource).Hash;transition_fp8=(Get-FileHash $transitionSource).Hash;selftest=(Get-FileHash "$PSScriptRoot/selftest.hip").Hash};binary_sha256=@{dll=(Get-FileHash "$OutputDirectory/nr_plan.dll").Hash;selftest=(Get-FileHash "$OutputDirectory/nr_plan_selftest.exe").Hash};gpu_executed=$false}|ConvertTo-Json -Depth 4|Out-File "$OutputDirectory/build.json" -Encoding utf8
+  [ordered]@{source_sha256=@{header=(Get-FileHash "$PSScriptRoot/nr_plan.h").Hash;runtime=(Get-FileHash "$PSScriptRoot/nr_plan.cpp").Hash;stage_fp8=(Get-FileHash $stageSource).Hash;vit_fp8=(Get-FileHash $vitSource).Hash;bottleneck_fp8=(Get-FileHash $bottleneckSource).Hash;transition_fp8=(Get-FileHash $transitionSource).Hash;io_fp8=(Get-FileHash $ioSource).Hash;selftest=(Get-FileHash "$PSScriptRoot/selftest.hip").Hash};binary_sha256=@{dll=(Get-FileHash "$OutputDirectory/nr_plan.dll").Hash;selftest=(Get-FileHash "$OutputDirectory/nr_plan_selftest.exe").Hash};gpu_executed=$false}|ConvertTo-Json -Depth 4|Out-File "$OutputDirectory/build.json" -Encoding utf8
 }finally{$env:HIP_PATH=$oldHip}

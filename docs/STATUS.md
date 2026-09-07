@@ -2,6 +2,15 @@
 
 更新时间：2026-09-07。
 
+最新完整原生 71-block 分阶段/逐操作重测见
+[`NATIVE_OPERATION_TIMING_20260907.md`](NATIVE_OPERATION_TIMING_20260907.md)。
+两组 B-A-B-A、每进程 5 warmup + 12 帧：未插桩整图 48 帧 median **212.908 ms**，
+P95 **260.854 ms**；计时图 median **213.190 ms**。这是 HIP event envelope，
+不是 kernel-busy counter；运行间波动较大，不能把此前 162.726 ms 单帧当成稳定热态基准。
+96 个测量帧输出 hash 一致；逐操作计时剔除 1 个含负时间戳的整帧，47 帧有效。
+C256/C32/C128 阶段 interval median 为 **40.558/36.570/33.405 ms**，FFN 为主要热点。
+原始时序、RTX 画质和游戏部署仍未通过；RGP counter halt 保持。
+
 截至当前的完整性能优化分析见
 [`PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md`](PERFORMANCE_OPTIMIZATION_ANALYSIS_20260906.md)。
 最新 Swin 主干重构实测见
@@ -16,8 +25,60 @@ ABI v3、分段模型包、gfx1201 派生缓存、时序门和 33 ms 统一验�
 [`NATIVE_TEMPORAL_ENGINE_V3_20260907.md`](NATIVE_TEMPORAL_ENGINE_V3_20260907.md)。
 最新 resident-FP8 尺度切换与 C256 最小 GPU 门见
 [`NATIVE_SCALE_TRANSITION_FP8_20260907.md`](NATIVE_SCALE_TRANSITION_FP8_20260907.md)。
+最新 C64/C128/C256 紧凑 resident pool、显式 QKV 边界与单块 GPU 门见
+[`NRPLAN_RESIDENT_POOL_BRINGUP_20260907.md`](NRPLAN_RESIDENT_POOL_BRINGUP_20260907.md)。
 
 ## 已完成
+
+- 首个完全由 C++/HIP `NRPlan` 持有的 1080p record 0..70 单帧链路已在 RX 9070 XT
+  通过：reset/single-color 近似 FP8 路径输出 8,294,400 个 FP16 值，全部有限且非零，
+  SHA-256 为 `2A756063FB97D2F88BE384A09129F085055EE08C1E9917B1BF8005270DDB56E3`。
+  实际 Graph 为 738 kernel＋5 memcpy，诊断 event span 186.000 ms；Graph source/executable、
+  148,300,672 B 权重和 550,736,384 B 主 workspace 均由 plan 持有，不引用 PyTorch
+  allocation pool，销毁后 allocator 为0 B。`complete_native_topology=true`，但原始时序契约
+  尚未恢复，因此 `temporal_contract_verified=false`、`deployment_ready=false`。这证明完整
+  固定拓扑能执行，不代表参考画质、游戏接入或33 ms达标。
+- edge scratch生命周期复用已将边界scratch从1,145,077,760 B降到858,808,320 B，节省
+  286,269,440 B且输出hash不变。随后将Pre/Head和44个标准block的三次Q/K/V发布合并为
+  单次uniform 32-bit发布，完整Graph 738→646 kernel（−12.47%），输出仍逐位一致，单帧
+  诊断event span 186.000→178.936 ms（−3.80%）。这是一次单帧功能/方向性时间证据，尚未
+  达到独立进程B-A-B-A性能晋级门。
+- 新增`(window,head,16-token tile)`有界full-fused QKV：WMMA projection、原FP16归一化
+  舍入顺序和LUT E4M3发布在一个6 KiB LDS kernel中完成，且使用uniform 32-bit store。
+  1080p完整链输出hash仍逐位一致，Graph 646→554 kernel，单帧诊断event span
+  178.936→164.774 ms；相对首个完整原生链已减24.93% kernel、11.41%时间。默认分段回退
+  仍保留；该结果尚需B-A-B-A后才能作为稳定性能结论。
+- “full-fused QKV直接读取FP16 post”虽将节点降到510且hash一致，但event span回退到
+  172.099 ms，已拒绝。随后确认C64–C256 FFN入口已生成resident E4M3，外层又重复发布
+  同一post；删除这44次重复发布后，完整链hash仍逐位一致，Graph 554→510 kernel并通过
+  ≤512门，event span 164.774→162.726 ms。相对首个完整原生链，kernel累计减少30.89%、
+  单帧诊断时间降低12.51%。该配置保留为下一轮B-A-B-A候选。
+- 已隔离此前 C256 非有限值的实际边界：计划私有 scratch 中的 post-FFN E4M3 与 FP16
+  语义边界逐字节一致，而回写 550,736,384 B 通用 arena 的 FP8 resident 子区后失效；
+  因此不是原权重、LUT、矩阵方向或 E4M3 编码错误。C64/C128/C256 现共用一次分配的
+  七段紧凑 resident pool，并显式执行 `QKV project+norm FP16 → E4M3 publish`；Output
+  Project 继续读取 FP16 residual。单窗口完整块均有限并通过独立近似性能门：C64/C128/
+  C256 的最终 NRMSE 分别为 0.022728/0.028150/0.031244，最大绝对误差分别为
+  0.0625/0.0625/0.03125。旧严格 NRMSE 0.02 门未降低，游戏默认路径未改变。
+- 同分辨率连续 standard block 的 resident 输出直连已通过 C64 record 5→6 的普通窗口/
+  shifted-window 单提交 GPU 门：NRMSE 0.047536、最大误差0.125，两个stage计数均为2。
+  中间 Encoder 尺度也已在同一 NRPlan 内实机接通：C64 record 8→transition→C128 record 9
+  为 NRMSE 0.050560/max 0.03125，C128 record 14→transition→C256 record 15 为
+  NRMSE 0.064962/max 0.015625，transition消费计数均为1且资源释放到0 B。v71采用可复用
+  plan-owned target和持久skip pool；生产接口仍强制8个transition，单边界入口仅供最小门。
+  C64→C128→C64 的Encoder/Decoder闭环也通过：三个stage、两个transition、一个持久skip，
+  最终NRMSE 0.073520/max 0.03125。C32特殊FFN已纳入同一resident ABI，record 4 C32→
+  transition→record 5 C64为NRMSE 0.038678/max 0.0625。当前显式同步仍是bring-up手段，
+  不是最终性能结果。后续已完成C512与中央ViT resident接通：C256→C512为NRMSE
+  0.062453/max 0.0625，C256→C512→C256闭环为0.085806/max 0.1875。
+  完整record 1–69的1080p主干已一次提交通过，60个Swin/C512 block、8个ViT、8条scale
+  transition和中央双向bottleneck计数全部正确，输出有限且hash为
+  `B97CDE1719F1FEAEC0167E14490F8DAD412116629EF49B05E5EB72C9FCD9C3A1`。
+  去除外层host boundary后hash不变，诊断event span 181.493→163.573 ms（−9.87%）；
+  该口径不含Pre/Head，不能替代完整网络benchmark。进一步去除FFN/QKV内部同步并捕获
+  plan-owned resident Graph后，修复版单帧门以完全相同hash通过：Graph由NRPlan持有且不引用
+  外部分配，包含718个kernel与5个memcpy节点，诊断event span为150.295 ms，相比异步固定序列
+  再降8.12%，相比原边界序列累计下降17.19%；资源释放为0且无新系统事件。
 
 - 原生运行时接口升级到 ABI v3 并编译通过：固定 shape、显式 current/history/motion/depth/
   exposure/jitter/reset binding、strict/approx precision、GPU event 性能统计，以及导入 D3D12
@@ -28,14 +89,16 @@ ABI v3、分段模型包、gfx1201 派生缓存、时序门和 33 ms 统一验�
 - ABI v3 arena 的1080p strict workspace为435,196,416 B；当前诊断版approx arena为
   550,736,384 B。approx stage resident为1 byte，并复用grouped/post/Q/K/V/value scratch；
   新增108,539,904 B固定FP16 QKV投影区，用于将矩阵与norm错误独立定界。
-- C32–C256 共44个 Swin block core、16个独立C512 split core 与8个ViT core已形成 C++ 自有
+- C32–C256 共44个 Swin block core、16个独立C512 split core、8个ViT core以及原生
+  Pre/Head 已形成 C++ 自有
   resident-FP8 recorder topology：诊断期C32每块7 dispatch，C64–C256每块8，C512每块7，ViT每块5；
-  加上中央C512↔ViT transition和8个Encoder/Decoder尺度切换后，合计覆盖69/71个record、
-  理论506 kernel＋5 D2D memcpy；诊断拆分后已只剩6个kernel节点预算，不能直接加入Pre/Head。
+  加上中央C512↔ViT transition和8个Encoder/Decoder尺度切换后，现已覆盖71/71个record。
+  旧描述符的“理论节点数”只是概念launch计数，不能用于≤512验收；全链实测为738 kernel＋
+  5 memcpy，仍超出节点预算226个。
   C32首次192 VGPR/scratch候选已拒绝；8-wave重写为50 VGPR、4 KiB LDS、
   0 scratch。C512 grouped为72 VGPR/8 KiB LDS；所有矩阵路径均生成gfx1201 FP8 WMMA且
-  0 scratch。当前状态为`PARTIAL_69_OF_71_NATIVE_RECORDS_WITH_SCALE_TRANSITIONS_NOT_RUNTIME_ACCEPTED`，
-  完整拓扑与deployment门仍为false。
+  0 scratch。当前功能状态为`FULL_71_NATIVE_SINGLE_COLOR_RESET_TOPOLOGY_NOT_RUNTIME_ACCEPTED`；
+  完整拓扑为true，时序与deployment门仍为false。
 - ViT为640-token流式全局attention，不物化N×N矩阵；五类kernel均静态生成FP8 WMMA，
   VGPR为62/62/42/88/85、最大LDS 3 KiB、0 scratch。该结论仅来自编译/ISA，不代表数值或速度通过。
 - 中央边界已直接实现resident C512 pooling→512×1024→ViT，以及ViT→1024×512→2×expand＋skip；
@@ -132,13 +195,13 @@ ABI v3、分段模型包、gfx1201 派生缓存、时序门和 33 ms 统一验�
 
 ## 尚未完成
 
-- 1080p 33 ms：最后可采信完整严格路径仍为220.061 ms、4,653 kernel+59 memcpy；本轮
-  原生接口/缓存工作没有新的整帧GPU时间，不能按理论或编译成功推算收益。
-- 先完成C256捕获kernel参数/写目标的静态与CPU侧诊断，修复Q/K/V发布边界后，再完成
-  C256→C128→C64→C32→C512 resident block 的串行 GPU correctness/performance gate；
-  scale transitions已绑定但尚未GPU验收。随后实现
-  Pre与Head并验证已编译的ViT，使0 PyTorch hot node、
-  ≤512 graph node真正跑通。当前安全记录不授权自动启动下一GPU门。
+- 1080p 33 ms：新的完整原生 reset/single-color 最佳单帧候选为162.726 ms，约为目标的4.93倍；
+  它与220.061 ms严格路径并非同一数值/时序语义，不能把差值当成等价画质提速。Graph仍有
+  510 kernel，已通过节点预算；下一性能工作是B-A-B-A确认、Pre/Head边界融合、移除诊断arena
+  以及降低每个kernel本身的矩阵/内存成本。
+  当前安全记录不授权自动启动下一GPU门。
+- 原始 history/motion/depth/exposure/jitter/reset 关系以及 next-history 写回仍待5070序列确认；
+  现有record 0/70只覆盖reset/single-color功能链，不能接入正式时序游戏路径。
 - RTX 5070 24×32原始时序序列与有界差分结论；在它们完成前 temporal mode保持禁用。
 
 - 4K60：当前同口径约 1.2 秒/帧，距离 16.67 ms 很远。

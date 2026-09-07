@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <array>
 #include <cstdint>
+#include "stage_fp8_api.h"
 
 using F8 = float __attribute__((ext_vector_type(8)));
 using I2 = int __attribute__((ext_vector_type(2)));
@@ -170,7 +171,7 @@ template<int C> __global__ void stage_scatter_fp8(
 // and the byte-identical E4M3 view consumed by the QKV stage below.
 template<int C> __global__ void stage_ffn_mix_fp8(
     const uint8_t* grouped,const uint8_t* mix,const _Float16* seed,
-    _Float16* post,uint8_t* post_resident,int windows) {
+    _Float16* post,int windows) {
     int lane=threadIdx.x,token=lane%16,half=lane/16;
     int task=blockIdx.x,out_tile=task%(C/16),tile=task/(C/16);
     int window=tile/4,row=tile%4*16+token;
@@ -190,8 +191,35 @@ template<int C> __global__ void stage_ffn_mix_fp8(
         int channel=out_tile*16+half*8+e;
         size_t index=(size_t(window)*64+row)*C+channel;
         _Float16 result=hround(float(hround(acc[e]))+float(seed[index]));
-        post[index]=result;post_resident[index]=e4(float(result));
+        post[index]=result;
     }
+}
+
+// gfx1201 miscompiles FP8 byte publication when it is embedded in the
+// divergent WMMA producer above. Publish from the materialized semantic FP16
+// boundary in a uniform kernel. Four codes are committed by one 32-bit store.
+__global__ void stage_pack_e4x4_from_fp16(const uint16_t* input,uint32_t* output,
+    const uint8_t* lut,size_t scalar_count) {
+    size_t word=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    size_t base=word*4;if(base>=scalar_count)return;
+    uint32_t packed=0;
+    #pragma clang loop unroll(full)
+    for(int e=0;e<4;++e){
+        size_t index=base+size_t(e);
+        if(index<scalar_count)packed|=uint32_t(lut[input[index]])<<(e*8);
+    }
+    output[word]=packed;
+}
+
+extern "C" __declspec(dllexport) int nr_stage_debug_pack_e4x4_from_fp16(
+    const void* input,void* output,const void* lut,size_t scalar_count,void* stream) {
+    if(!input||!output||!lut||!scalar_count)return int(hipErrorInvalidValue);
+    size_t words=(scalar_count+3)/4;
+    hipLaunchKernelGGL(stage_pack_e4x4_from_fp16,
+        dim3(unsigned((words+255)/256)),dim3(256),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const uint16_t*>(input),
+        static_cast<uint32_t*>(output),static_cast<const uint8_t*>(lut),scalar_count);
+    return int(hipGetLastError());
 }
 
 // Diagnostic-safe QKV boundary for the standard C32-C256 families. Projection
@@ -260,25 +288,70 @@ template<int C> __global__ void stage_qkv_norm_fp16_inplace(
                part * C + head * 32 + lane] = result;
 }
 
-// Scalar, branch-free E4M3 publisher. It consumes the normalized FP16
-// projection in its native [window,token,3C] layout and writes the resident
-// [window,head,token,32] layout expected by attention.
-template<int C> __global__ void stage_qkv_pack_e4_from_fp16(
-    const _Float16* projection, uint8_t* q, uint8_t* k, uint8_t* v,
-    const uint8_t* lut, size_t scalar_count) {
-    size_t scalar = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (scalar >= scalar_count) return;
-    int lane = int(scalar % 32);
-    size_t vector = scalar / 32;
-    int part = int(vector % 3);
-    size_t index = vector / 3;
+// Fixed-target E4M3 publisher. Keep Q/K/V as three launches during correctness
+// bring-up: the prior combined kernel selected one of three unrelated output
+// pointers per lane and gfx1201 returned the normalized FP16 storage bytes even
+// though its ISA contained the expected LUT load and b8 store. A compile-time
+// part removes that final dynamic pointer selection without changing layout or
+// quantization semantics.
+template<int C, int PART> __global__ void stage_qkv_pack_e4x4_part_from_fp16(
+    const uint16_t* projection_bits, uint32_t* target_words, const uint8_t* lut,
+    size_t scalar_count) {
+    static_assert(PART >= 0 && PART < 3, "QKV part must be fixed at compile time");
+    size_t word = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t first_scalar = word * 4;
+    if (first_scalar >= scalar_count) return;
     constexpr int HEADS = C / 32;
-    int head = int(index / 64 % HEADS), token = int(index % 64);
-    size_t window = index / (64 * HEADS);
-    _Float16 value = projection[(window * 64 + token) * (3 * C) +
-                                part * C + head * 32 + lane];
-    uint8_t* target = part == 0 ? q : (part == 1 ? k : v);
-    target[index * 32 + lane] = e4_explicit(float(value), lut);
+    uint32_t packed = 0;
+    #pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        size_t scalar = first_scalar + item;
+        uint8_t code = 0;
+        if (scalar < scalar_count) {
+            int lane = int(scalar % 32);
+            size_t index = scalar / 32;
+            int head = int(index / 64 % HEADS), token = int(index % 64);
+            size_t window = index / (64 * HEADS);
+            uint16_t bits = projection_bits[(window * 64 + token) * (3 * C) +
+                                             PART * C + head * 32 + lane];
+            code = lut[bits];
+        }
+        packed |= uint32_t(code) << (item * 8);
+    }
+    target_words[word] = packed;
+}
+
+// Stage-specific compact publisher. Projection and normalization keep their
+// existing FP16 boundary; this kernel only combines the three independent,
+// uniform Q/K/V publication passes. Every store remains a 32-bit transaction,
+// avoiding the divergent byte-store pattern rejected during earlier gfx1201
+// bring-up.
+template<int C> __global__ void stage_qkv_pack_e4x4_all_from_fp16(
+    const uint16_t* projection_bits, uint32_t* q_words, uint32_t* k_words,
+    uint32_t* v_words, const uint8_t* lut, size_t scalar_count) {
+    size_t word = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    size_t first_scalar = word * 4;
+    if (first_scalar >= scalar_count) return;
+    constexpr int HEADS = C / 32;
+    uint32_t packed[3] = {};
+    #pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        size_t scalar = first_scalar + item;
+        if (scalar >= scalar_count) continue;
+        int lane = int(scalar % 32);
+        size_t index = scalar / 32;
+        int head = int(index / 64 % HEADS), token = int(index % 64);
+        size_t window = index / (64 * HEADS);
+        #pragma unroll
+        for (int part = 0; part < 3; ++part) {
+            uint16_t bits = projection_bits[(window * 64 + token) * (3 * C) +
+                                             part * C + head * 32 + lane];
+            packed[part] |= uint32_t(lut[bits]) << (item * 8);
+        }
+    }
+    q_words[word] = packed[0];
+    k_words[word] = packed[1];
+    v_words[word] = packed[2];
 }
 
 // C512 retains the prior bounded fused implementation until its dedicated
@@ -331,6 +404,77 @@ template<int C> __global__ void stage_qkv_norm_fused_fp8(
             _Float16 normalized = hround(value * float(hround(rsqrtf(fmaxf(sum, 6.198883056640625e-5f)))));
             if (part == 0) normalized = hround(float(normalized) * float(qscale[head]));
             (part == 0 ? q : k)[index] = e4(float(normalized));
+        }
+    }
+}
+
+__device__ __forceinline__ uint16_t half_bits(_Float16 value) {
+    union Bits { _Float16 half; uint16_t bits; } converted;
+    converted.half=value;return converted.bits;
+}
+
+// One bounded workgroup owns (window, head, 16-token tile). It keeps the same
+// WMMA accumulation and FP16 normalization order as the split path, but stores
+// Q/K/V through uniform LUT-backed 32-bit transactions. This is an opt-in
+// candidate; the materialized projection path remains the default rollback.
+template<int C,bool POST_FP16> __global__ void stage_qkv_full_fused_lut_fp8(
+    const void* post_raw,const uint8_t* qkv_column_major,const _Float16* qscale,
+    const int32_t* permutation,uint32_t* q_words,uint32_t* k_words,
+    uint32_t* v_words,const uint8_t* lut,int windows) {
+    __shared__ _Float16 projection[3][32][16];
+    constexpr int HEADS=C/32;
+    int lane=threadIdx.x,token=lane%16,half=lane/16;
+    int task=blockIdx.x,head=task%HEADS,tile=task/HEADS;
+    int window=tile/4,row=tile%4*16+token;
+    if(window>=windows)return;
+    #pragma clang loop unroll(disable)
+    for(int part=0;part<3;++part){
+      #pragma clang loop unroll(disable)
+      for(int out_half=0;out_half<2;++out_half){
+        F8 acc={};
+        #pragma clang loop unroll(disable)
+        for(int chunk=0;chunk<C/16;++chunk){
+            I2 packed_weight={},packed_activation={};
+            for(int e=0;e<8;++e){
+                int source=chunk*16+half*8+e;
+                int global_out=part*C+head*32+out_half*16+token;
+                packed_weight[e/4]|=unsigned(
+                    qkv_column_major[global_out*C+source])<<((e%4)*8);
+                size_t post_index=(size_t(window)*64+row)*C+permutation[source];
+                uint8_t activation;
+                if constexpr(POST_FP16)
+                    activation=lut[half_bits(static_cast<const _Float16*>(post_raw)[post_index])];
+                else activation=static_cast<const uint8_t*>(post_raw)[post_index];
+                packed_activation[e/4]|=unsigned(activation)<<((e%4)*8);
+            }
+            acc=fp8_mma(packed_weight,packed_activation,acc);
+        }
+        for(int e=0;e<8;++e)
+            projection[part][out_half*16+half*8+e][token]=hround(acc[e]);
+      }
+    }
+    __syncthreads();
+    uint32_t* targets[3]={q_words,k_words,v_words};
+    for(int local_row=0;local_row<16;++local_row){
+        size_t vector=((size_t(window)*HEADS+head)*64+tile%4*16+local_row)*32;
+        #pragma unroll
+        for(int part=0;part<3;++part){
+            _Float16 h=projection[part][lane][local_row],result=h;
+            if(part!=2){
+                float value=float(h),sum=float(hround(value*value));
+                for(int offset=1;offset<32;offset*=2){
+                    float other=__shfl_down(sum,offset,32);
+                    if((lane%(2*offset))==0)sum=float(hround(sum+other));
+                }
+                sum=__shfl(sum,0,32);
+                result=hround(value*float(hround(
+                    rsqrtf(fmaxf(sum,6.198883056640625e-5f)))));
+                if(part==0)result=hround(float(result)*float(qscale[head]));
+            }
+            uint32_t code=lut[half_bits(result)],base=uint32_t(lane&~3);
+            uint32_t packed=__shfl(code,base,32)|(__shfl(code,base+1,32)<<8)|
+                (__shfl(code,base+2,32)<<16)|(__shfl(code,base+3,32)<<24);
+            if((lane&3)==0)targets[part][vector/4+lane/4]=packed;
         }
     }
 }
@@ -585,6 +729,55 @@ __global__ void stage_c32_ffn_fp8(
     }
 }
 
+// Output Head already arrives as one resident 8x8-window stream.  Re-gathering
+// it through a synthetic image would add a full-frame materialization and can
+// change padded-lane semantics.  This edge-specific entry keeps the exact C32
+// FFN math above but interprets authored a/residual indices within each window.
+__global__ void stage_head_c32_ffn_fp8(
+    const uint8_t* raw,const uint8_t* expand,const uint8_t* contract,
+    const _Float16* scale,const int32_t* ai,const int32_t* ri,
+    const int32_t* permutation,_Float16* post,uint8_t* resident,int windows) {
+    __shared__ _Float16 hidden[128][16];
+    const int wave=threadIdx.x/32,lane=threadIdx.x%32,token=lane%16,half=lane/16;
+    const int tile=blockIdx.x,window=tile/4,row=tile%4*16+token;
+    if(window>=windows)return;
+    F8 expand_acc={};
+    for(int chunk=0;chunk<2;++chunk){
+        I2 packed_weight={},packed_activation={};
+        for(int e=0;e<8;++e){
+            const int k=chunk*16+half*8+e;
+            packed_weight[e/4]|=unsigned(expand[k*128+wave*16+token])<<((e%4)*8);
+            const int32_t source=ai[row*32+k];
+            packed_activation[e/4]|=unsigned(raw[(size_t(window)*64*32)+source])<<((e%4)*8);
+        }
+        expand_acc=fp8_mma(packed_weight,packed_activation,expand_acc);
+    }
+    for(int e=0;e<8;++e)
+        hidden[wave*16+half*8+e][token]=cubic(hround(expand_acc[e]));
+    __syncthreads();
+    if(wave>=2)return;
+    F8 contract_acc={};
+    for(int chunk=0;chunk<8;++chunk){
+        I2 packed_weight={},packed_activation={};
+        for(int e=0;e<8;++e){
+            const int k=chunk*16+half*8+e;
+            packed_weight[e/4]|=unsigned(contract[k*32+wave*16+token])<<((e%4)*8);
+            packed_activation[e/4]|=unsigned(e4(float(hidden[permutation[k%32]+
+                k/32*32][token])))<<((e%4)*8);
+        }
+        contract_acc=fp8_mma(packed_weight,packed_activation,contract_acc);
+    }
+    for(int e=0;e<8;++e){
+        const int channel=wave*16+half*8+e;
+        const int32_t source=ri[row*32+channel];
+        const _Float16 residual=e4h(raw[(size_t(window)*64*32)+source]);
+        const _Float16 seed=hround(float(residual)*float(scale[channel]));
+        const _Float16 result=hround(float(hround(contract_acc[e]))+float(seed));
+        const size_t index=(size_t(window)*64+row)*32+channel;
+        post[index]=result;resident[index]=e4(float(result));
+    }
+}
+
 static int c32_ffn_entry(const void* raw,const void* expand,const void* contract,
     const void* scale,const void* ai,const void* ri,const void* permutation,
     void* post,void* resident,int windows,int width,int height,int ox,int oy,void* stream) {
@@ -651,11 +844,56 @@ template<int C> static int qkv_entry(const void* post,const void* qkv,const void
         dim3(unsigned((scalars+255)/256)),dim3(256),0,hip_stream,
         static_cast<_Float16*>(projection),static_cast<const _Float16*>(qscale),vectors);
     error=hipGetLastError();if(error!=hipSuccess)return int(error);
-    hipLaunchKernelGGL((stage_qkv_pack_e4_from_fp16<C>),
-        dim3(unsigned((scalars+255)/256)),dim3(256),0,hip_stream,
-        static_cast<const _Float16*>(projection),q_bytes,k_bytes,v_bytes,
-        static_cast<const uint8_t*>(lut),scalars);
+    size_t part_scalars=vectors*32;
+    size_t part_words=(part_scalars+3)/4;
+    hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<C,0>),
+        dim3(unsigned((part_words+255)/256)),dim3(256),0,hip_stream,
+        static_cast<const uint16_t*>(projection),reinterpret_cast<uint32_t*>(q_bytes),
+        static_cast<const uint8_t*>(lut),part_scalars);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<C,1>),
+        dim3(unsigned((part_words+255)/256)),dim3(256),0,hip_stream,
+        static_cast<const uint16_t*>(projection),reinterpret_cast<uint32_t*>(k_bytes),
+        static_cast<const uint8_t*>(lut),part_scalars);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<C,2>),
+        dim3(unsigned((part_words+255)/256)),dim3(256),0,hip_stream,
+        static_cast<const uint16_t*>(projection),reinterpret_cast<uint32_t*>(v_bytes),
+        static_cast<const uint8_t*>(lut),part_scalars);
     return int(hipGetLastError());
+}
+
+template<int C> static int qkv_ordered_entry(const void* post,const void* qkv,
+    const void* qscale,const void* permutation,void* projection,void* q,void* k,void* v,
+    const void* lut,int windows,void* stream) {
+    if(!post||!qkv||!qscale||!permutation||!projection||!q||!k||!v||!lut||
+       windows<1||windows>262144)return int(hipErrorInvalidValue);
+    auto hip_stream=reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL((stage_qkv_project_fp8<C>),dim3(windows*4*(3*C/16)),dim3(32),0,
+        hip_stream,static_cast<const uint8_t*>(post),static_cast<const uint8_t*>(qkv),
+        static_cast<const int32_t*>(permutation),static_cast<_Float16*>(projection),windows);
+    hipError_t error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    error=hipStreamSynchronize(hip_stream);if(error!=hipSuccess)return int(error);
+    size_t vectors=size_t(windows)*(C/32)*64;
+    size_t scalars=vectors*3*32;
+    hipLaunchKernelGGL((stage_qkv_norm_fp16_inplace<C>),
+        dim3(unsigned((scalars+255)/256)),dim3(256),0,hip_stream,
+        static_cast<_Float16*>(projection),static_cast<const _Float16*>(qscale),vectors);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    error=hipStreamSynchronize(hip_stream);if(error!=hipSuccess)return int(error);
+    size_t part_scalars=vectors*32;
+    size_t part_words=(part_scalars+3)/4;
+#define PUBLISH_ORDERED_QKV(PART,TARGET) \
+    hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<C,PART>), \
+        dim3(unsigned((part_words+255)/256)),dim3(256),0,hip_stream, \
+        static_cast<const uint16_t*>(projection),reinterpret_cast<uint32_t*>(TARGET), \
+        static_cast<const uint8_t*>(lut),part_scalars); \
+    error=hipGetLastError();if(error!=hipSuccess)return int(error)
+    PUBLISH_ORDERED_QKV(0,q);
+    PUBLISH_ORDERED_QKV(1,k);
+    PUBLISH_ORDERED_QKV(2,v);
+#undef PUBLISH_ORDERED_QKV
+    return int(hipStreamSynchronize(hip_stream));
 }
 
 template<int C> static int qkv_fused_entry(const void* post,const void* qkv,const void* qscale,
@@ -670,12 +908,91 @@ template<int C> static int qkv_fused_entry(const void* post,const void* qkv,cons
     return int(hipGetLastError());
 }
 
+template<int C> static int qkv_compact_publish_entry(const void* post,const void* qkv,
+    const void* qscale,const void* permutation,void* projection,void* q,void* k,void* v,
+    const void* lut,int windows,void* stream) {
+    if(!post||!qkv||!qscale||!permutation||!projection||!q||!k||!v||!lut||
+       windows<1||windows>262144)return int(hipErrorInvalidValue);
+    auto hip_stream=reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL((stage_qkv_project_fp8<C>),dim3(windows*4*(3*C/16)),dim3(32),0,
+        hip_stream,static_cast<const uint8_t*>(post),static_cast<const uint8_t*>(qkv),
+        static_cast<const int32_t*>(permutation),static_cast<_Float16*>(projection),windows);
+    hipError_t error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    size_t vectors=size_t(windows)*(C/32)*64;
+    size_t scalars=vectors*3*32;
+    hipLaunchKernelGGL((stage_qkv_norm_fp16_inplace<C>),
+        dim3(unsigned((scalars+255)/256)),dim3(256),0,hip_stream,
+        static_cast<_Float16*>(projection),static_cast<const _Float16*>(qscale),vectors);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    size_t part_scalars=vectors*32,part_words=(part_scalars+3)/4;
+    hipLaunchKernelGGL((stage_qkv_pack_e4x4_all_from_fp16<C>),
+        dim3(unsigned((part_words+255)/256)),dim3(256),0,hip_stream,
+        static_cast<const uint16_t*>(projection),reinterpret_cast<uint32_t*>(q),
+        reinterpret_cast<uint32_t*>(k),reinterpret_cast<uint32_t*>(v),
+        static_cast<const uint8_t*>(lut),part_scalars);
+    return int(hipGetLastError());
+}
+
+// Diagnostic-only direct publisher used to separate graph-capture defects from
+// the gfx1201 byte/word publication path. It is not part of the frame hot path.
+extern "C" __declspec(dllexport) int nr_stage_debug_pack_e4x4_c256(
+    const void* projection, void* target, const void* lut, size_t scalar_count,
+    int part, void* stream) {
+    if (!projection || !target || !lut || !scalar_count || part < 0 || part > 2)
+        return int(hipErrorInvalidValue);
+    size_t words = (scalar_count + 3) / 4;
+    auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    if (part == 0)
+        hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<256,0>),
+            dim3(unsigned((words + 255) / 256)), dim3(256), 0, hip_stream,
+            static_cast<const uint16_t*>(projection), static_cast<uint32_t*>(target),
+            static_cast<const uint8_t*>(lut), scalar_count);
+    else if (part == 1)
+        hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<256,1>),
+            dim3(unsigned((words + 255) / 256)), dim3(256), 0, hip_stream,
+            static_cast<const uint16_t*>(projection), static_cast<uint32_t*>(target),
+            static_cast<const uint8_t*>(lut), scalar_count);
+    else
+        hipLaunchKernelGGL((stage_qkv_pack_e4x4_part_from_fp16<256,2>),
+            dim3(unsigned((words + 255) / 256)), dim3(256), 0, hip_stream,
+            static_cast<const uint16_t*>(projection), static_cast<uint32_t*>(target),
+            static_cast<const uint8_t*>(lut), scalar_count);
+    return int(hipGetLastError());
+}
+
+// Fixed-sequence bring-up entry: materialize the FP16 QKV projection and its
+// normalization as a completed boundary before a separate resident publisher
+// consumes it. This avoids relying on the failing arena-local producer/consumer
+// visibility path while preserving the existing mathematical operations.
+extern "C" __declspec(dllexport) int nr_stage_c256_qkv_projection_norm_fp16(
+    const void* post,const void* qkv,const void* qscale,const void* permutation,
+    void* projection,int windows,void* stream) {
+    if(!post||!qkv||!qscale||!permutation||!projection||windows<1||windows>262144)
+        return int(hipErrorInvalidValue);
+    auto hip_stream=reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL((stage_qkv_project_fp8<256>),dim3(windows*4*(3*256/16)),
+        dim3(32),0,hip_stream,static_cast<const uint8_t*>(post),
+        static_cast<const uint8_t*>(qkv),static_cast<const int32_t*>(permutation),
+        static_cast<_Float16*>(projection),windows);
+    hipError_t error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    error=hipStreamSynchronize(hip_stream);if(error!=hipSuccess)return int(error);
+    constexpr size_t vectors_per_window=(256/32)*64;
+    size_t vectors=size_t(windows)*vectors_per_window;
+    size_t scalars=vectors*3*32;
+    hipLaunchKernelGGL((stage_qkv_norm_fp16_inplace<256>),
+        dim3(unsigned((scalars+255)/256)),dim3(256),0,hip_stream,
+        static_cast<_Float16*>(projection),static_cast<const _Float16*>(qscale),vectors);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    return int(hipStreamSynchronize(hip_stream));
+}
+
 template<int C> static int ffn_entry(const void* raw,const void* expand,const void* contract,
     const void* mix,const void* scale,const void* ai,const void* ri,const void* permutation,
     const void* inverse_permutation,void* grouped,void* seed,void* post,void* post_resident,
-    int windows,int width,int height,int ox,int oy,void* stream) {
+    const void* lut,int windows,int width,int height,int ox,int oy,int force_publish_sync,
+    void* stream) {
     if(!raw||!expand||!contract||!mix||!scale||!ai||!ri||!permutation||
-       !inverse_permutation||!grouped||!seed||!post||!post_resident||
+       !inverse_permutation||!grouped||!seed||!post||!post_resident||!lut||
        windows<1||windows>262144||width<=0||height<=0||width%4||height%4||
        (ox!=0&&ox!=-4)||(oy!=0&&oy!=-4))return int(hipErrorInvalidValue);
     auto hip_stream=reinterpret_cast<hipStream_t>(stream);
@@ -688,8 +1005,18 @@ template<int C> static int ffn_entry(const void* raw,const void* expand,const vo
     hipError_t error=hipGetLastError();if(error!=hipSuccess)return int(error);
     hipLaunchKernelGGL((stage_ffn_mix_fp8<C>),dim3(windows*4*(C/16)),dim3(32),0,
         hip_stream,static_cast<const uint8_t*>(grouped),static_cast<const uint8_t*>(mix),
-        static_cast<const _Float16*>(seed),static_cast<_Float16*>(post),
-        static_cast<uint8_t*>(post_resident),windows);
+        static_cast<const _Float16*>(seed),static_cast<_Float16*>(post),windows);
+    error=hipGetLastError();if(error!=hipSuccess)return int(error);
+    // Diagnostic ordering fence for direct/fixed-sequence execution. Stream
+    // synchronization is illegal while NRPlan records the equivalent graph.
+    if(force_publish_sync){
+        error=hipStreamSynchronize(hip_stream);if(error!=hipSuccess)return int(error);
+    }
+    size_t scalars=size_t(windows)*64*C,words=(scalars+3)/4;
+    hipLaunchKernelGGL(stage_pack_e4x4_from_fp16,
+        dim3(unsigned((words+255)/256)),dim3(256),0,hip_stream,
+        static_cast<const uint16_t*>(post),static_cast<uint32_t*>(post_resident),
+        static_cast<const uint8_t*>(lut),scalars);
     return int(hipGetLastError());
 }
 
@@ -727,16 +1054,72 @@ template<int C> static int project_entry(const void* post,const void* value,cons
     return int(hipGetLastError());
 }
 
+// Keep the standard C64-C256 stage launch sequence in the same HIP translation
+// unit as its kernels.  Besides reducing the runtime ABI surface, this gives the
+// native plan one stable stage-specific entry point for fixed-sequence replay.
+// The stop flag is diagnostic-only and cuts the sequence after Q/K/V publish.
+template<int C> static int standard_stage_entry(
+    const void* raw,const void* expand,const void* contract,const void* mix,
+    const void* ffn_scale,const void* ai,const void* ri,const void* ffn_permutation,
+    const void* inverse_permutation,void* grouped,void* seed,void* post,
+    void* post_resident,const void* qkv,const void* qscale,const void* permutation,
+    void* qkv_projection,void* q,void* k,void* v,const void* lut,const void* bias,
+    void* value,const void* project,const void* residual_scale,void* output,
+    void* next_resident,int windows,int width,int height,int ox,int oy,int stop_after_qkv,
+    int force_publish_sync,void* stream) {
+    int error=ffn_entry<C>(raw,expand,contract,mix,ffn_scale,ai,ri,ffn_permutation,
+        inverse_permutation,grouped,seed,post,post_resident,lut,windows,width,height,ox,oy,
+        force_publish_sync,stream);
+    if(error)return error;
+    error=qkv_entry<C>(post_resident,qkv,qscale,permutation,qkv_projection,q,k,v,lut,
+        windows,stream);
+    if(error||stop_after_qkv)return error;
+    error=attention_entry<C>(q,k,v,bias,value,windows,stream);
+    if(error)return error;
+    error=project_entry<C>(post,value,project,residual_scale,permutation,output,
+        post_resident,windows,stream);
+    if(error)return error;
+    return scatter_entry<C>(post_resident,next_resident,width,height,ox,oy,stream);
+}
+
 #define EXPORT_STAGE(C) \
-extern "C" __declspec(dllexport) int nr_stage_c##C##_ffn_fp8(const void* raw,const void* expand,const void* contract,const void* mix,const void* scale,const void* ai,const void* ri,const void* permutation,const void* inverse_permutation,void* grouped,void* seed,void* post,void* post_resident,int windows,int width,int height,int ox,int oy,void* stream){return ffn_entry<C>(raw,expand,contract,mix,scale,ai,ri,permutation,inverse_permutation,grouped,seed,post,post_resident,windows,width,height,ox,oy,stream);} \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_ffn_fp8(const void* raw,const void* expand,const void* contract,const void* mix,const void* scale,const void* ai,const void* ri,const void* permutation,const void* inverse_permutation,void* grouped,void* seed,void* post,void* post_resident,const void* lut,int windows,int width,int height,int ox,int oy,int force_publish_sync,void* stream){return ffn_entry<C>(raw,expand,contract,mix,scale,ai,ri,permutation,inverse_permutation,grouped,seed,post,post_resident,lut,windows,width,height,ox,oy,force_publish_sync,stream);} \
 extern "C" __declspec(dllexport) int nr_stage_c##C##_qkv_norm_fp8(const void* post,const void* qkv,const void* qscale,const void* permutation,void* projection,void* q,void* k,void* v,const void* lut,int windows,void* stream){return qkv_entry<C>(post,qkv,qscale,permutation,projection,q,k,v,lut,windows,stream);} \
 extern "C" __declspec(dllexport) int nr_stage_c##C##_attention_fp8(const void* q,const void* k,const void* v,const void* bias,void* value,int windows,void* stream){return attention_entry<C>(q,k,v,bias,value,windows,stream);} \
 extern "C" __declspec(dllexport) int nr_stage_c##C##_project_fp8(const void* post,const void* value,const void* weight,const void* scale,const void* permutation,void* output,void* next,int windows,void* stream){return project_entry<C>(post,value,weight,scale,permutation,output,next,windows,stream);} \
-extern "C" __declspec(dllexport) int nr_stage_c##C##_scatter_fp8(const void* logical,void* packed,int width,int height,int ox,int oy,void* stream){return scatter_entry<C>(logical,packed,width,height,ox,oy,stream);}
+extern "C" __declspec(dllexport) int nr_stage_c##C##_scatter_fp8(const void* logical,void* packed,int width,int height,int ox,int oy,void* stream){return scatter_entry<C>(logical,packed,width,height,ox,oy,stream);} \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_block_fp8(const void* raw,const void* expand,const void* contract,const void* mix,const void* ffn_scale,const void* ai,const void* ri,const void* ffn_permutation,const void* inverse_permutation,void* grouped,void* seed,void* post,void* post_resident,const void* qkv,const void* qscale,const void* permutation,void* qkv_projection,void* q,void* k,void* v,const void* lut,const void* bias,void* value,const void* project,const void* residual_scale,void* output,void* next_resident,int windows,int width,int height,int ox,int oy,int stop_after_qkv,int force_publish_sync,void* stream){return standard_stage_entry<C>(raw,expand,contract,mix,ffn_scale,ai,ri,ffn_permutation,inverse_permutation,grouped,seed,post,post_resident,qkv,qscale,permutation,qkv_projection,q,k,v,lut,bias,value,project,residual_scale,output,next_resident,windows,width,height,ox,oy,stop_after_qkv,force_publish_sync,stream);}
+
+#define EXPORT_STAGE_LAUNCH(C) \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_block_launch(const NRStandardStageLaunch* p){if(!p)return int(hipErrorInvalidValue);return standard_stage_entry<C>(p->raw,p->expand,p->contract,p->mix,p->ffn_scale,p->a_index,p->residual_index,p->ffn_permutation,p->inverse_permutation,p->grouped,p->seed,p->post,p->post_resident,p->qkv,p->qscale,p->permutation,p->qkv_projection,p->q,p->k,p->v,p->lut,p->bias,p->value,p->project,p->residual_scale,p->output,p->next_resident,p->windows,p->width,p->height,p->origin_x,p->origin_y,p->stop_after_qkv,p->force_publish_sync,p->stream);}
+
+#define EXPORT_ORDERED_QKV(C) \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_qkv_ordered_fp8(const void* post,const void* qkv,const void* qscale,const void* permutation,void* projection,void* q,void* k,void* v,const void* lut,int windows,void* stream){return qkv_ordered_entry<C>(post,qkv,qscale,permutation,projection,q,k,v,lut,windows,stream);}
+
+#define EXPORT_COMPACT_QKV(C) \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_qkv_compact_publish_fp8(const void* post,const void* qkv,const void* qscale,const void* permutation,void* projection,void* q,void* k,void* v,const void* lut,int windows,void* stream){return qkv_compact_publish_entry<C>(post,qkv,qscale,permutation,projection,q,k,v,lut,windows,stream);}
+
+#define EXPORT_FULL_FUSED_QKV(C) \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_qkv_full_fused_fp8(const void* post,const void* qkv,const void* qscale,const void* permutation,void* q,void* k,void* v,const void* lut,int windows,void* stream){if(!post||!qkv||!qscale||!permutation||!q||!k||!v||!lut||windows<1||windows>262144)return int(hipErrorInvalidValue);hipLaunchKernelGGL((stage_qkv_full_fused_lut_fp8<C,false>),dim3(windows*(C/32)*4),dim3(32),0,reinterpret_cast<hipStream_t>(stream),post,static_cast<const uint8_t*>(qkv),static_cast<const _Float16*>(qscale),static_cast<const int32_t*>(permutation),reinterpret_cast<uint32_t*>(q),reinterpret_cast<uint32_t*>(k),reinterpret_cast<uint32_t*>(v),static_cast<const uint8_t*>(lut),windows);return int(hipGetLastError());} \
+extern "C" __declspec(dllexport) int nr_stage_c##C##_qkv_full_fused_from_fp16(const void* post,const void* qkv,const void* qscale,const void* permutation,void* q,void* k,void* v,const void* lut,int windows,void* stream){if(!post||!qkv||!qscale||!permutation||!q||!k||!v||!lut||windows<1||windows>262144)return int(hipErrorInvalidValue);hipLaunchKernelGGL((stage_qkv_full_fused_lut_fp8<C,true>),dim3(windows*(C/32)*4),dim3(32),0,reinterpret_cast<hipStream_t>(stream),post,static_cast<const uint8_t*>(qkv),static_cast<const _Float16*>(qscale),static_cast<const int32_t*>(permutation),reinterpret_cast<uint32_t*>(q),reinterpret_cast<uint32_t*>(k),reinterpret_cast<uint32_t*>(v),static_cast<const uint8_t*>(lut),windows);return int(hipGetLastError());}
 
 EXPORT_STAGE(64)
 EXPORT_STAGE(128)
 EXPORT_STAGE(256)
+EXPORT_STAGE_LAUNCH(64)
+EXPORT_STAGE_LAUNCH(128)
+EXPORT_STAGE_LAUNCH(256)
+EXPORT_ORDERED_QKV(32)
+EXPORT_ORDERED_QKV(64)
+EXPORT_ORDERED_QKV(128)
+EXPORT_ORDERED_QKV(256)
+EXPORT_COMPACT_QKV(64)
+EXPORT_COMPACT_QKV(128)
+EXPORT_COMPACT_QKV(256)
+EXPORT_FULL_FUSED_QKV(32)
+EXPORT_FULL_FUSED_QKV(64)
+EXPORT_FULL_FUSED_QKV(128)
+EXPORT_FULL_FUSED_QKV(256)
 
 extern "C" __declspec(dllexport) int nr_stage_c32_ffn_fp8(const void* raw,
     const void* expand,const void* contract,const void*,const void* scale,const void* ai,
@@ -745,10 +1128,30 @@ extern "C" __declspec(dllexport) int nr_stage_c32_ffn_fp8(const void* raw,
     return c32_ffn_entry(raw,expand,contract,scale,ai,ri,permutation,post,resident,
         windows,width,height,ox,oy,stream);
 }
+extern "C" __declspec(dllexport) int nr_stage_head_c32_ffn_fp8(const void* raw,
+    const void* expand,const void* contract,const void* scale,const void* ai,
+    const void* ri,const void* permutation,void* post,void* resident,int windows,
+    void* stream) {
+    if(!raw||!expand||!contract||!scale||!ai||!ri||!permutation||!post||!resident||
+       windows<1||windows>262144)return int(hipErrorInvalidValue);
+    hipLaunchKernelGGL(stage_head_c32_ffn_fp8,dim3(windows*4),dim3(256),0,
+        reinterpret_cast<hipStream_t>(stream),static_cast<const uint8_t*>(raw),
+        static_cast<const uint8_t*>(expand),static_cast<const uint8_t*>(contract),
+        static_cast<const _Float16*>(scale),static_cast<const int32_t*>(ai),
+        static_cast<const int32_t*>(ri),static_cast<const int32_t*>(permutation),
+        static_cast<_Float16*>(post),static_cast<uint8_t*>(resident),windows);
+    return int(hipGetLastError());
+}
 extern "C" __declspec(dllexport) int nr_stage_c32_qkv_norm_fp8(const void* post,
     const void* qkv,const void* qscale,const void* permutation,void* projection,
     void* q,void* k,void* v,const void* lut,int windows,void* stream) {
     return qkv_entry<32>(post,qkv,qscale,permutation,projection,q,k,v,lut,windows,stream);
+}
+extern "C" __declspec(dllexport) int nr_stage_c32_qkv_compact_publish_fp8(
+    const void* post,const void* qkv,const void* qscale,const void* permutation,
+    void* projection,void* q,void* k,void* v,const void* lut,int windows,void* stream) {
+    return qkv_compact_publish_entry<32>(post,qkv,qscale,permutation,projection,q,k,v,
+        lut,windows,stream);
 }
 extern "C" __declspec(dllexport) int nr_stage_c32_attention_fp8(const void* q,
     const void* k,const void* v,const void* bias,void* value,int windows,void* stream) {
@@ -793,3 +1196,5 @@ extern "C" __declspec(dllexport) int nr_stage_c512_scatter_fp8(const void* logic
     return scatter_entry<512>(logical,packed,width,height,ox,oy,stream);
 }
 #undef EXPORT_STAGE
+#undef EXPORT_STAGE_LAUNCH
+#undef EXPORT_ORDERED_QKV

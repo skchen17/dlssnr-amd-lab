@@ -20,7 +20,7 @@ def test_cpu_preflight_binds_one_origin_zero_block_without_gpu(tmp_path):
     result, arena, block = preflight(args(tmp_path))
     assert result['status'] == 'CPU_PREFLIGHT_PASS_GPU_NOT_EXECUTED'
     assert result['gpu_executed'] is False
-    assert result['expected_graph_kernel_nodes'] == 8
+    assert result['expected_graph_kernel_nodes'] == 11
     assert result['complete_native_topology'] is False
     assert block['record_number'] == 5
     assert arena['workspace_bytes'] < 1_000_000_000
@@ -41,3 +41,6 @@ def test_qkv_poison_is_synchronized_across_runtime_streams():
     assert 'nrPlanDebugGetKernelU64Arguments' in source
     assert "'kernel_argument_audit': kernel_argument_audit" in source
     assert "'exact': captured == expected_arguments" in source
+    assert "'kernel_pointer_audits': pointer_audits" in source
+    assert "'stage_e4_lut_audit': stage_e4_lut_audit" in source
+    assert 'nr_stage_debug_pack_e4x4_c256' in source

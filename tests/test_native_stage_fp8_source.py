@@ -11,13 +11,18 @@ def test_stage_source_preserves_bounded_fusion_and_stage_specific_families():
     assert 'EXPORT_STAGE(128)' in source
     assert 'EXPORT_STAGE(256)' in source
     assert 'next_resident[index] = e4(float(result))' in source
-    assert 'post_resident[index]=e4(float(result))' in source
+    assert 'stage_pack_e4x4_from_fp16' in source
+    assert 'output[word]=packed' in source
+    assert 'nr_stage_debug_pack_e4x4_from_fp16' in source
+    assert 'NRStandardStageLaunch' in source
+    assert 'EXPORT_STAGE_LAUNCH(256)' in source
     assert 'stage_scatter_fp8' in source
     assert 'window_source_index<C>' in source
     assert 'nr_stage_e4_from_fp16_lut[__half_as_ushort(rounded)]' in source
     assert 'nr_stage_initialize_e4_lut' in source
     assert 'hipMalloc(explicit_lut, table.size())' in source
-    assert 'e4_explicit(float(value), lut)' in source
+    assert 'uint16_t bits = projection_bits[' in source
+    assert 'code = lut[bits]' in source
     assert 'std::array<uint8_t, 65536> table' in source
     assert '__hip_cvt_float_to_fp8' not in source
     assert '__hip_cvt_float2_to_fp8x2' not in source
@@ -33,15 +38,18 @@ def test_stage_source_preserves_bounded_fusion_and_stage_specific_families():
     assert 'nr_stage_c32_project_fp8' in source
     assert 'nr_stage_c32_scatter_fp8' in source
     assert 'stage_qkv_norm_fp16_inplace' in source
-    assert 'stage_qkv_pack_e4_from_fp16' in source
+    assert 'stage_qkv_pack_e4x4_part_from_fp16' in source
     assert '_Float16* projection, const _Float16* qscale, size_t vectors' in source
-    assert 'uint8_t* q, uint8_t* k, uint8_t* v,' in source
-    assert 'uint8_t* target = part == 0 ? q : (part == 1 ? k : v)' in source
+    assert 'template<int C, int PART> __global__ void stage_qkv_pack_e4x4_part_from_fp16' in source
+    assert 'static_assert(PART >= 0 && PART < 3' in source
     assert 'if (part != 2)' in source
     assert 'v_bytes-k_bytes!=resident_stride' in source
-    assert 'target[index * 32 + lane] = e4_explicit(float(value), lut)' in source
+    assert 'target_words[word] = packed' in source
+    assert 'nr_stage_debug_pack_e4x4_c256' in source
     assert 'stage_qkv_norm_fp16_inplace<C>' in source
-    assert 'stage_qkv_pack_e4_from_fp16<C>' in source
+    assert 'stage_qkv_pack_e4x4_part_from_fp16<C,0>' in source
+    assert 'stage_qkv_pack_e4x4_part_from_fp16<C,1>' in source
+    assert 'stage_qkv_pack_e4x4_part_from_fp16<C,2>' in source
     assert 'reinterpret_cast<uint16_t*>(target)' not in source
 
 

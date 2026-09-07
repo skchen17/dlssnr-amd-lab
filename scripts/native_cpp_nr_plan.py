@@ -81,7 +81,7 @@ def validate_v3_layouts():
     expected = {ShapeDescV3: 52, BindingsV3: 152, ExternalSyncV3: 40,
                 ApproxStageBlock: 240, ApproxSplit512Block: 248,
                 ApproxVitBlock: 152, ApproxBottleneck: 112,
-                ApproxScaleTransition: 96,
+                ApproxScaleTransition: 96, ApproxPre: 160, ApproxHead: 136,
                 PerformanceStats: 48, ModelPackageStats: 272}
     actual = {kind.__name__: ct.sizeof(kind) for kind in expected}
     wrong = {kind.__name__: (ct.sizeof(kind), size)
@@ -216,6 +216,45 @@ class ApproxScaleTransition(ct.Structure):
               ('skip_scale_weight_offset',ct.c_uint64))
 
 
+class ApproxPre(ct.Structure):
+    _fields_=(('struct_size',ct.c_uint32),('padded_width',ct.c_uint32),
+              ('padded_height',ct.c_uint32),('windows',ct.c_uint32),
+              ('color_scale',ct.c_float),('frame_seed_xor',ct.c_uint32),
+              ('conditioning',ct.c_float*5),('reserved',ct.c_uint32),
+              ('input_project_weight_offset',ct.c_uint64),
+              ('ffn_expand_weight_offset',ct.c_uint64),
+              ('ffn_contract_weight_offset',ct.c_uint64),
+              ('ffn_scale_weight_offset',ct.c_uint64),
+              ('a_index_weight_offset',ct.c_uint64),
+              ('residual_index_weight_offset',ct.c_uint64),
+              ('ffn_permutation_weight_offset',ct.c_uint64),
+              ('ffn_inverse_permutation_weight_offset',ct.c_uint64),
+              ('qkv_weight_offset',ct.c_uint64),('qscale_weight_offset',ct.c_uint64),
+              ('permutation_weight_offset',ct.c_uint64),
+              ('position_bias_weight_offset',ct.c_uint64),
+              ('project_weight_offset',ct.c_uint64),
+              ('residual_scale_weight_offset',ct.c_uint64))
+
+
+class ApproxHead(ct.Structure):
+    _fields_=(('struct_size',ct.c_uint32),('padded_width',ct.c_uint32),
+              ('padded_height',ct.c_uint32),('windows',ct.c_uint32),
+              ('main_scale_weight_offset',ct.c_uint64),
+              ('skip_scale_weight_offset',ct.c_uint64),
+              ('tail_weight_offset',ct.c_uint64),
+              ('ffn_expand_weight_offset',ct.c_uint64),
+              ('ffn_contract_weight_offset',ct.c_uint64),
+              ('ffn_scale_weight_offset',ct.c_uint64),
+              ('a_index_weight_offset',ct.c_uint64),
+              ('residual_index_weight_offset',ct.c_uint64),
+              ('ffn_permutation_weight_offset',ct.c_uint64),
+              ('qkv_weight_offset',ct.c_uint64),('qscale_weight_offset',ct.c_uint64),
+              ('permutation_weight_offset',ct.c_uint64),
+              ('position_bias_weight_offset',ct.c_uint64),
+              ('project_weight_offset',ct.c_uint64),
+              ('residual_scale_weight_offset',ct.c_uint64))
+
+
 class ArenaRegion(ct.Structure):
     _fields_=(('offset',ct.c_uint64),('bytes',ct.c_uint64),('alignment',ct.c_uint32),
               ('kind',ct.c_uint32),('name',ct.c_char*64))
@@ -321,6 +360,28 @@ def approximate_scale_transition_descriptor_array(topology):
     return (ApproxScaleTransition * len(values))(*values)
 
 
+def approximate_edge_descriptors(topology):
+    if topology.get('abi_version') != 3 or \
+            topology.get('status') != 'FULL_NATIVE_SINGLE_COLOR_EDGES_NOT_RUNTIME_ACCEPTED':
+        raise ValueError('unrecognized native edge topology')
+    pre=topology.get('pre',{});head=topology.get('head',{})
+    if pre.get('struct_size') != ct.sizeof(ApproxPre) or \
+            head.get('struct_size') != ct.sizeof(ApproxHead):
+        raise ValueError('native edge descriptor ABI mismatch')
+    pre_header={'struct_size','padded_width','padded_height','windows','color_scale',
+                'frame_seed_xor','conditioning','reserved'}
+    pre_fields=[name for name,_ in ApproxPre._fields_ if name not in pre_header]
+    conditioning=(ct.c_float*5)(*pre['conditioning'])
+    pre_value=ApproxPre(ct.sizeof(ApproxPre),pre['padded_width'],pre['padded_height'],
+        pre['windows'],pre['color_scale'],pre['frame_seed_xor'],conditioning,0,
+        *(pre[name] for name in pre_fields))
+    head_header={'struct_size','padded_width','padded_height','windows'}
+    head_fields=[name for name,_ in ApproxHead._fields_ if name not in head_header]
+    head_value=ApproxHead(ct.sizeof(ApproxHead),head['padded_width'],head['padded_height'],
+        head['windows'],*(head[name] for name in head_fields))
+    return pre_value,head_value
+
+
 class CapturedNRPlan:
     classification='CPP_OWNED_CAPTURED_KERNEL_GRAPH'
     full_math_reauthored=False
@@ -413,6 +474,13 @@ class CapturedNRPlan:
             ct.POINTER(ApproxBottleneck)]
         d.nrPlanConfigureApproxScaleTransitions.argtypes=[ct.c_void_p,
             ct.POINTER(ApproxScaleTransition),ct.c_uint32]
+        d.nrPlanConfigureApproxPre.argtypes=[ct.c_void_p,ct.POINTER(ApproxPre)]
+        d.nrPlanConfigureApproxHead.argtypes=[ct.c_void_p,ct.POINTER(ApproxHead)]
+        d.nrPlanSetApproxEdgeCompactQkv.argtypes=[ct.c_void_p,ct.c_uint8]
+        d.nrPlanSetApproxStandardCompactQkv.argtypes=[ct.c_void_p,ct.c_uint8]
+        d.nrPlanSetApproxFullFusedQkv.argtypes=[ct.c_void_p,ct.c_uint8]
+        d.nrPlanSetApproxFusedQkvConsumesFp16.argtypes=[ct.c_void_p,ct.c_uint8]
+        d.nrPlanSetApproxElideRedundantPostPublish.argtypes=[ct.c_void_p,ct.c_uint8]
         d.nrPlanInitializeArenaFromDevice.argtypes=[ct.c_void_p,ct.c_uint64,ct.c_void_p,
                                                     ct.c_uint64]
         d.nrPlanDebugCopyArenaToDevice.argtypes=[ct.c_void_p,ct.c_uint64,ct.c_void_p,
@@ -436,6 +504,12 @@ class CapturedNRPlan:
                      'nrPlanGetResourceStats','nrPlanConfigureArena','nrPlanConfigureApproxStageBlocks',
                      'nrPlanConfigureApproxSplit512Blocks','nrPlanConfigureApproxVitBlocks',
                      'nrPlanConfigureApproxBottleneck','nrPlanConfigureApproxScaleTransitions',
+                     'nrPlanConfigureApproxPre','nrPlanConfigureApproxHead',
+                     'nrPlanSetApproxEdgeCompactQkv',
+                     'nrPlanSetApproxStandardCompactQkv',
+                     'nrPlanSetApproxFullFusedQkv',
+                     'nrPlanSetApproxFusedQkvConsumesFp16',
+                     'nrPlanSetApproxElideRedundantPostPublish',
                      'nrPlanInitializeArenaFromDevice','nrPlanDebugCopyArenaToDevice',
                      'nrPlanUploadWeights',
                      'nrPlanSetRecorder','nrPlanSetRecorderV3','nrPlanSetPrecisionProfile',
